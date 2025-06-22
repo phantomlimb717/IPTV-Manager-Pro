@@ -24,7 +24,7 @@ No installation is required. Simply download the `IPTV Manager v0.2.4.exe` file 
 1.  Download `IPTV Manager v0.2.4.exe` from the latest release.
 2.  Run the executable file. The application is portable and will create its database (`iptv_store.db`) and log files in the same folder it is run from.
 3.  Use the `Add Entry` or `Import URL` buttons to add your first account.
-4.  Select accounts and use the `Check Selected` or `Check All Visible` buttons to refresh their status from the provider's API (note: check all visible will take a while if you have many playlists).
+4.  Select accounts and use the `Check Selected` or `Check All Visible` buttons to refresh their status from the provider's API (*note*: check all visible will take a while if you have many playlists).
 
 ## License
 

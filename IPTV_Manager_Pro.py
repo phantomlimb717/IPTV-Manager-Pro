@@ -1,0 +1,1250 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import sys
+import os
+import sqlite3
+import json
+import logging
+import time
+# import html # Not currently used
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timezone, timedelta
+
+# --- Dependency Check & Imports ---
+try:
+    import zoneinfo
+except ImportError:
+    print("Error: 'zoneinfo' module required (Python 3.9+). Please upgrade Python or install 'backports.zoneinfo'.", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import requests
+except ImportError:
+    print("\nError: Required library 'requests' not found. Please install it: pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QTableView, QPushButton, QDialog, QLineEdit, QComboBox,
+        QFormLayout, QMessageBox, QDialogButtonBox, QLabel,
+        QListWidget, QListWidgetItem, QInputDialog, QMenu,
+        QAbstractItemView, QHeaderView, QStatusBar, QProgressBar,
+        QFileDialog
+    )
+    from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication
+    from PySide6.QtCore import (
+        Qt, Slot, Signal, QObject, QThread, QModelIndex, QSortFilterProxyModel,
+        QDateTime, QTimer
+    )
+except ImportError:
+    print("\nError: Required library 'PySide6' not found. Please install it: pip install PySide6", file=sys.stderr)
+    sys.exit(1)
+
+# --- Resource Path Helper for PyInstaller ---
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+# --- Configuration ---
+APP_NAME = "IPTV Manager Pro"
+APP_VERSION = "0.2.4" # Incremented version for new features
+DATABASE_NAME = 'iptv_store.db'
+LOG_FILE = 'iptv_manager_log.txt'
+USER_AGENT = f'{APP_NAME}/{APP_VERSION} (okhttp/3.12.1)'
+API_TIMEOUT = 15
+REQUEST_DELAY_BETWEEN_CHECKS = 0.2
+
+REPORT_DISPLAY_TIMEZONE = "America/Los_Angeles" # Example
+try:
+    DISPLAY_TZ = zoneinfo.ZoneInfo(REPORT_DISPLAY_TIMEZONE)
+except zoneinfo.ZoneInfoNotFoundError:
+    DISPLAY_TZ = timezone.utc
+
+# --- Setup Logging ---
+logging.basicConfig(
+    level=logging.DEBUG, # Keep DEBUG for now
+    format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+    filename=LOG_FILE,
+    filemode='w'
+)
+console_handler = logging.StreamHandler(sys.stderr)
+console_handler.setLevel(logging.WARNING)
+formatter = logging.Formatter('%(levelname)s: %(message)s')
+console_handler.setFormatter(formatter)
+logging.getLogger('').addHandler(console_handler)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+# =============================================================================
+# DATABASE UTILITIES
+# =============================================================================
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def initialize_database():
+    logging.info(f"Initializing database: {DATABASE_NAME}")
+    conn = None
+    try:
+        if not os.path.exists(DATABASE_NAME):
+            logging.info(f"Database not found. Creating '{DATABASE_NAME}'...")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT DEFAULT 'Uncategorized',
+                server_base_url TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                last_checked_at TEXT,
+                api_status TEXT,
+                api_message TEXT,
+                expiry_date_ts INTEGER,
+                is_trial INTEGER,
+                active_connections INTEGER,
+                max_connections INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                raw_user_info TEXT,
+                raw_server_info TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL
+            )
+        ''')
+        cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Uncategorized')")
+        conn.commit()
+        logging.info("Database initialized/verified successfully.")
+        return True
+    except sqlite3.Error as e:
+        logging.error(f"Database initialization error: {e}")
+        print(f"CRITICAL: Database initialization error: {e}", file=sys.stderr)
+        return False
+    finally:
+        if conn: conn.close()
+
+def add_entry(name, category, server_url, username, password):
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute('''
+            INSERT INTO entries (name, category, server_base_url, username, password)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (name, category, server_url, username, password))
+        conn.commit()
+        entry_id = cursor.lastrowid
+        logging.info(f"Added entry: {name} (ID: {entry_id})")
+        return entry_id
+    finally: conn.close()
+
+def update_entry(entry_id, name, category, server_url, username, password):
+    conn = get_db_connection()
+    try:
+        conn.execute('''
+            UPDATE entries
+            SET name = ?, category = ?, server_base_url = ?, username = ?, password = ?
+            WHERE id = ?
+        ''', (name, category, server_url, username, password, entry_id))
+        conn.commit()
+        logging.info(f"Updated entry ID: {entry_id}")
+    finally: conn.close()
+
+def delete_entry(entry_id):
+    conn = get_db_connection()
+    try:
+        conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+        conn.commit()
+        logging.info(f"Deleted entry ID: {entry_id}")
+    finally: conn.close()
+
+def get_all_entries(category_filter=None):
+    conn = get_db_connection()
+    try:
+        query = "SELECT * FROM entries"
+        params = []
+        if category_filter and category_filter != "All Categories":
+            query += " WHERE category = ?"
+            params.append(category_filter)
+        query += " ORDER BY name COLLATE NOCASE ASC"
+        entries = conn.execute(query, params).fetchall()
+        return entries
+    finally: conn.close()
+
+def get_entry_by_id(entry_id):
+    conn = get_db_connection()
+    try:
+        entry = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+        return entry
+    finally: conn.close()
+
+def update_entry_status(entry_id, status_data):
+    conn = get_db_connection()
+    try:
+        current_time_iso = datetime.now(timezone.utc).isoformat()
+        conn.execute('''
+            UPDATE entries
+            SET last_checked_at = ?, api_status = ?, api_message = ?,
+                expiry_date_ts = ?, is_trial = ?, active_connections = ?,
+                max_connections = ?, raw_user_info = ?, raw_server_info = ?
+            WHERE id = ?
+        ''', (
+            current_time_iso, status_data.get('api_status'), status_data.get('api_message'),
+            status_data.get('expiry_date_ts'), status_data.get('is_trial'),
+            status_data.get('active_connections'), status_data.get('max_connections'),
+            status_data.get('raw_user_info'), status_data.get('raw_server_info'),
+            entry_id
+        ))
+        conn.commit()
+        logging.info(f"Updated status for entry ID: {entry_id} to {status_data.get('api_status')}")
+    except Exception as e: logging.error(f"Failed to update status for entry ID {entry_id}: {e}")
+    finally: conn.close()
+
+def get_all_categories():
+    conn = get_db_connection()
+    try:
+        categories = conn.execute("SELECT name FROM categories ORDER BY name COLLATE NOCASE ASC").fetchall()
+        return [cat['name'] for cat in categories]
+    finally: conn.close()
+
+def add_category(name):
+    conn = get_db_connection()
+    try:
+        conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (name,))
+        conn.commit()
+        logging.info(f"Added category: {name}")
+    except sqlite3.IntegrityError: logging.warning(f"Category '{name}' already exists.")
+    finally: conn.close()
+
+def rename_category(old_name, new_name):
+    conn = get_db_connection()
+    try:
+        existing = conn.execute("SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND LOWER(name) != LOWER(?)", (new_name, old_name)).fetchone()
+        if existing:
+            raise sqlite3.IntegrityError(f"Category '{new_name}' already exists.")
+        conn.execute("UPDATE categories SET name = ? WHERE name = ?", (new_name, old_name))
+        conn.execute("UPDATE entries SET category = ? WHERE category = ?", (new_name, old_name))
+        conn.commit()
+        logging.info(f"Renamed category '{old_name}' to '{new_name}'.")
+    finally: conn.close()
+
+def delete_category_and_reassign_entries(name):
+    conn = get_db_connection()
+    try:
+        if name.lower() == "uncategorized": return False
+        conn.execute("UPDATE entries SET category = 'Uncategorized' WHERE category = ?", (name,))
+        conn.execute("DELETE FROM categories WHERE name = ?", (name,))
+        conn.commit()
+        logging.info(f"Deleted category '{name}' and reassigned entries.")
+        return True
+    except Exception as e:
+        logging.error(f"Error deleting category {name}: {e}")
+        return False
+    finally: conn.close()
+
+# =============================================================================
+# URL PARSING UTILITY
+# =============================================================================
+def parse_get_php_url(url_string):
+    details = {'error': None, 'server_base_url': None, 'username': None, 'password': ""}
+    try:
+        parsed_url = urlparse(url_string)
+        query_params = parse_qs(parsed_url.query)
+        scheme = parsed_url.scheme; hostname = parsed_url.hostname; port = parsed_url.port
+        username = query_params.get('username', [None])[0]
+        password_list = query_params.get('password', [""]); password = password_list[0] if password_list else ""
+        if not all([scheme, hostname, username is not None]):
+            details['error'] = "Invalid URL: Missing scheme, host, or username parameter."
+            logging.warning(f"URL Parse Error: {details['error']} for URL: {url_string}")
+            return details
+        server_base_url = f"{scheme}://{hostname}"
+        if port and not ((scheme == 'http' and port == 80) or (scheme == 'https' and port == 443)):
+            server_base_url += f":{port}"
+        details['server_base_url'] = server_base_url; details['username'] = username; details['password'] = password
+        logging.info(f"Parsed URL: {server_base_url}, User: {username}")
+        return details
+    except Exception as e:
+        logging.error(f"Critical failure to parse URL '{url_string}': {e}")
+        details['error'] = f"Critical parsing error: {e}"; return details
+
+# =============================================================================
+# API UTILITIES
+# =============================================================================
+API_HEADERS = {'User-Agent': USER_AGENT}
+def get_safe_api_value(data_dict, key, default=None):
+    if not isinstance(data_dict, dict): return default
+    value = data_dict.get(key); return default if value == "" else value
+
+def format_timestamp_display(unix_timestamp_utc):
+    if unix_timestamp_utc is None or not isinstance(unix_timestamp_utc, (int, float)) or unix_timestamp_utc <= 0: return "N/A"
+    try:
+        dt_utc = datetime.fromtimestamp(int(unix_timestamp_utc), tz=timezone.utc); dt_local = dt_utc.astimezone(DISPLAY_TZ)
+        return dt_local.strftime('%Y-%m-%d %H:%M %Z')
+    except: return "Invalid"
+
+def format_trial_status_display(is_trial):
+    if is_trial is None: return "N/A"
+    return "Yes" if str(is_trial) == '1' else "No"
+
+def check_account_status_detailed_api(server_base_url, username, password, session):
+    processed_data = {
+        'success': False, 'api_status': None, 'api_message': "Check init error",
+        'expiry_date_ts': None, 'is_trial': None, 'active_connections': None,
+        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None
+    }
+    # Session should be initialized before this is called in a loop.
+    if not all([server_base_url, username is not None, session]):
+        processed_data['api_message'] = "Internal Error: Missing parameters for API call"
+        return processed_data
+
+    try:
+        parsed_base = urlparse(server_base_url)
+        if not parsed_base.scheme or not parsed_base.netloc:
+            raise ValueError("Invalid server_base_url format")
+        api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_user_info"
+    except Exception as url_e:
+        processed_data['api_message'] = f"Invalid Server URL: {url_e}"
+        return processed_data
+
+    logging.info(f"API Check: {parsed_base.scheme}://{parsed_base.netloc}/... (User: {username})")
+    response_text = None
+    try:
+        response = session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
+        response_text = response.text
+        response.raise_for_status()
+        data = response.json()
+
+        processed_data['raw_user_info'] = json.dumps(data.get('user_info')) if data.get('user_info') is not None else None
+        processed_data['raw_server_info'] = json.dumps(data.get('server_info')) if data.get('server_info') is not None else None
+        user_info = data.get('user_info', {})
+
+        if not isinstance(user_info, dict):
+            processed_data['api_message'] = "Invalid 'user_info' format"
+            processed_data['success'] = False
+            return processed_data
+
+        auth_status = get_safe_api_value(user_info, 'auth')
+        if auth_status == 0 or str(auth_status) == '0':
+            processed_data['api_message'] = "Authentication Failed (auth: 0)"
+            processed_data['api_status'] = "Auth Failed"
+            processed_data['success'] = False
+            return processed_data
+
+        current_api_msg = ""
+        if 'status' not in user_info:
+            if not user_info:
+                current_api_msg = "'user_info' object empty and missing 'status'"
+            else:
+                current_api_msg = "'user_info' missing 'status' field"
+            processed_data['api_status'] = 'Unknown'
+
+        processed_data['success'] = True
+        api_status_val = get_safe_api_value(user_info, 'status')
+        if api_status_val is not None:
+             processed_data['api_status'] = api_status_val
+        
+        user_info_message = get_safe_api_value(user_info, 'message', '')
+        if user_info_message:
+             processed_data['api_message'] = f"{current_api_msg} {user_info_message}".strip() if current_api_msg else user_info_message
+        elif current_api_msg:
+             processed_data['api_message'] = current_api_msg
+        else:
+             processed_data['api_message'] = ''
+
+        exp_date_raw = get_safe_api_value(user_info, 'exp_date')
+        if exp_date_raw is not None:
+            try:
+                exp_ts = int(exp_date_raw)
+                processed_data['expiry_date_ts'] = exp_ts if exp_ts > 0 else None
+            except (ValueError, TypeError):
+                logging.warning(f"API Check {username}: Invalid exp_date format '{exp_date_raw}'")
+                pass
+
+        is_trial_raw = get_safe_api_value(user_info, 'is_trial')
+        if is_trial_raw is not None:
+            try:
+                processed_data['is_trial'] = int(is_trial_raw)
+            except (ValueError, TypeError):
+                logging.warning(f"API Check {username}: Invalid is_trial format '{is_trial_raw}'")
+                pass
+
+        active_c_raw = get_safe_api_value(user_info, 'active_cons')
+        if active_c_raw is not None:
+            try:
+                processed_data['active_connections'] = int(active_c_raw)
+            except (ValueError, TypeError):
+                logging.warning(f"API Check {username}: Invalid active_cons format '{active_c_raw}'")
+                pass
+
+        max_c_raw = get_safe_api_value(user_info, 'max_connections')
+        if max_c_raw is not None:
+            try:
+                processed_data['max_connections'] = int(max_c_raw)
+            except (ValueError, TypeError):
+                logging.warning(f"API Check {username}: Invalid max_connections format '{max_c_raw}'")
+                pass
+        
+        if processed_data['success'] and processed_data['api_status'] in [None, 'Unknown'] and not processed_data['api_message']:
+            processed_data['api_message'] = "Valid connection but key data missing from API."
+
+        return processed_data
+
+    except requests.exceptions.Timeout:
+        processed_data['api_message'] = f"Request Timeout ({API_TIMEOUT}s)"
+    except requests.exceptions.HTTPError as e:
+        processed_data['api_message'] = f"HTTP Error {e.response.status_code}"
+        if response_text and ('raw_user_info' not in processed_data or not processed_data['raw_user_info']):
+             processed_data['raw_user_info'] = json.dumps({"error_context_response": response_text[:500]})
+    except requests.exceptions.RequestException:
+        processed_data['api_message'] = "Connection Error"
+    except json.JSONDecodeError:
+        processed_data['api_message'] = "Invalid JSON response"
+        if response_text and ('raw_user_info' not in processed_data or not processed_data['raw_user_info']):
+             processed_data['raw_user_info'] = json.dumps({"non_json_response": response_text[:500]})
+    except Exception as e:
+        processed_data['api_message'] = f"Unexpected API Error: {type(e).__name__}"
+        logging.exception(f"Unexpected error during API check for {username}.")
+    
+    processed_data['success'] = False
+    return processed_data
+
+# =============================================================================
+# DIALOGS
+# =============================================================================
+class EntryDialog(QDialog):
+    def __init__(self, entry_id=None, parent=None):
+        super().__init__(parent); self.entry_id = entry_id; self.is_edit_mode = entry_id is not None
+        self.setWindowTitle(f"{'Edit' if self.is_edit_mode else 'Add'} IPTV Entry"); self.setMinimumWidth(450); self.setWindowModality(Qt.WindowModal)
+        layout = QVBoxLayout(self); form_layout = QFormLayout()
+        self.name_edit = QLineEdit(); self.category_combo = QComboBox(); self.server_url_edit = QLineEdit(); self.username_edit = QLineEdit()
+        self.password_edit = QLineEdit(); self.password_edit.setEchoMode(QLineEdit.Password); self.populate_categories()
+        form_layout.addRow("Display Name:", self.name_edit); form_layout.addRow("Category:", self.category_combo)
+        form_layout.addRow("Server URL (e.g., http://domain:port):", self.server_url_edit); form_layout.addRow("Username:", self.username_edit)
+        form_layout.addRow("Password:", self.password_edit); layout.addLayout(form_layout)
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept_dialog); self.button_box.rejected.connect(self.reject); layout.addWidget(self.button_box)
+        if self.is_edit_mode: self.load_entry_data()
+        self.name_edit.setFocus()
+    def populate_categories(self):
+        self.category_combo.clear();
+        try: cats = get_all_categories(); self.category_combo.addItems(cats if cats else ["Uncategorized"])
+        except Exception as e: logging.error(f"Failed to populate categories: {e}"); self.category_combo.addItem("Uncategorized")
+    def load_entry_data(self):
+        try:
+            entry = get_entry_by_id(self.entry_id)
+            if entry:
+                self.name_edit.setText(entry['name']); self.server_url_edit.setText(entry['server_base_url'])
+                self.username_edit.setText(entry['username']); self.password_edit.setText(entry['password'])
+                idx = self.category_combo.findText(entry['category'])
+                if idx != -1: self.category_combo.setCurrentIndex(idx)
+                else: self.category_combo.addItem(entry['category']); self.category_combo.setCurrentText(entry['category'])
+            else: QMessageBox.warning(self, "Error", "Could not load entry data."); self.reject()
+        except Exception as e: logging.error(f"Error loading entry ID {self.entry_id}: {e}"); QMessageBox.critical(self, "Load Error", f"Failed to load: {e}"); self.reject()
+    def get_data(self): return {"name": self.name_edit.text().strip(), "category": self.category_combo.currentText(), "server_url": self.server_url_edit.text().strip(), "username": self.username_edit.text().strip(), "password": self.password_edit.text()}
+    @Slot()
+    def accept_dialog(self):
+        data = self.get_data()
+        if not all([data['name'], data['server_url'], data['username'] is not None]): QMessageBox.warning(self, "Input Error", "Name, Server URL, and Username must be filled."); return
+        if not (data['server_url'].startswith("http://") or data['server_url'].startswith("https://")): QMessageBox.warning(self, "Input Error", "Server URL must start with http:// or https://."); return
+        try:
+            if self.is_edit_mode: update_entry(self.entry_id, data['name'], data['category'], data['server_url'], data['username'], data['password'])
+            else: add_entry(data['name'], data['category'], data['server_url'], data['username'], data['password'])
+            self.accept()
+        except Exception as e: logging.error(f"Error saving entry: {e}"); QMessageBox.critical(self, "Database Error", f"Could not save: {e}")
+
+class ManageCategoriesDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent); self.setWindowTitle("Manage Categories"); self.setMinimumWidth(350); self.setWindowModality(Qt.WindowModal)
+        layout = QVBoxLayout(self); self.category_list_widget = QListWidget(); self.category_list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        layout.addWidget(self.category_list_widget); button_layout = QHBoxLayout()
+        self.add_button = QPushButton("Add"); self.rename_button = QPushButton("Rename"); self.delete_button = QPushButton("Delete")
+        button_layout.addWidget(self.add_button); button_layout.addWidget(self.rename_button); button_layout.addWidget(self.delete_button); layout.addLayout(button_layout)
+        self.close_button = QPushButton("Close"); layout.addWidget(self.close_button, alignment=Qt.AlignRight)
+        self.add_button.clicked.connect(self.add_category_action); self.rename_button.clicked.connect(self.rename_category_action)
+        self.delete_button.clicked.connect(self.delete_category_action); self.close_button.clicked.connect(self.accept)
+        self.refresh_categories_list(); self.category_list_widget.itemSelectionChanged.connect(self.update_button_states); self.update_button_states()
+    def refresh_categories_list(self):
+        self.category_list_widget.clear()
+        try:
+            for cat_name in get_all_categories():
+                item = QListWidgetItem(cat_name)
+                if cat_name.lower() == "uncategorized": item.setFlags(item.flags() & ~(Qt.ItemIsSelectable | Qt.ItemIsEditable)); item.setForeground(QColor("gray"))
+                self.category_list_widget.addItem(item)
+        except Exception as e: logging.error(f"Failed to refresh categories in dialog: {e}")
+        self.update_button_states()
+    def update_button_states(self):
+        sel = self.category_list_widget.currentItem(); is_sel = sel is not None; is_uncat = is_sel and sel.text().lower() == "uncategorized"
+        self.rename_button.setEnabled(is_sel and not is_uncat); self.delete_button.setEnabled(is_sel and not is_uncat)
+
+    @Slot()
+    def add_category_action(self): # CORRECTED METHOD
+        new_name, ok = QInputDialog.getText(self, "Add Category", "Enter new category name:")
+        if ok and new_name.strip():
+            try:
+                add_category(new_name.strip())
+                self.refresh_categories_list()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Could not add category: {e}")
+        elif ok and not new_name.strip():
+            QMessageBox.warning(self, "Input Error", "Category name cannot be empty.")
+
+    @Slot()
+    def rename_category_action(self):
+        sel = self.category_list_widget.currentItem()
+        if not sel or sel.text().lower() == "uncategorized": return
+        old_name = sel.text(); new_name, ok = QInputDialog.getText(self, "Rename Category", f"New name for '{old_name}':", text=old_name)
+        if ok and new_name.strip() and new_name.strip().lower() != old_name.lower():
+            try: rename_category(old_name, new_name.strip()); self.refresh_categories_list();
+            except sqlite3.IntegrityError as e: QMessageBox.warning(self, "Rename Error", str(e))
+            except Exception as e: QMessageBox.critical(self, "Error", f"Could not rename: {e}")
+        elif ok and not new_name.strip(): QMessageBox.warning(self, "Input Error", "Name cannot be empty.")
+    @Slot()
+    def delete_category_action(self):
+        sel = self.category_list_widget.currentItem();
+        if not sel or sel.text().lower() == "uncategorized": return
+        name_del = sel.text(); reply = QMessageBox.question(self, "Confirm Delete", f"Delete category '{name_del}'?\nEntries will move to 'Uncategorized'.", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            if delete_category_and_reassign_entries(name_del): self.refresh_categories_list()
+            else: QMessageBox.warning(self, "Delete Error", f"Could not delete '{name_del}'.")
+
+class ImportUrlDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent); self.setWindowTitle("Import Entry from URL"); self.setMinimumWidth(500); self.setWindowModality(Qt.WindowModal)
+        layout = QVBoxLayout(self); form_layout = QFormLayout(); self.url_edit = QLineEdit(); self.url_edit.setPlaceholderText("http://server:port/get.php?username=...")
+        self.name_edit = QLineEdit(); self.name_edit.setPlaceholderText("Optional: Auto-generated if blank"); self.category_combo = QComboBox(); self.populate_categories()
+        form_layout.addRow("M3U Get Link URL:", self.url_edit); form_layout.addRow("Display Name (Optional):", self.name_edit); form_layout.addRow("Category:", self.category_combo)
+        layout.addLayout(form_layout); self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept_dialog); self.button_box.rejected.connect(self.reject); layout.addWidget(self.button_box); self.url_edit.setFocus()
+
+    def populate_categories(self):
+        self.category_combo.clear()
+        try:
+            cats = get_all_categories(); self.category_combo.addItems(cats if cats else ["Uncategorized"]); uncat_idx = self.category_combo.findText("Uncategorized")
+            if uncat_idx != -1: self.category_combo.setCurrentIndex(uncat_idx)
+        except Exception as e: logging.error(f"ImportUrlDialog: Failed to populate categories: {e}"); self.category_combo.addItem("Uncategorized")
+
+    def get_data(self): return {"url": self.url_edit.text().strip(), "name": self.name_edit.text().strip(), "category": self.category_combo.currentText()}
+
+    @Slot()
+    def accept_dialog(self):
+        data = self.get_data()
+        if not data['url']:
+            QMessageBox.warning(self, "Input Error", "M3U Get Link URL must be provided.")
+            return
+
+        parsed = parse_get_php_url(data['url'])
+        if not parsed or parsed.get('error'):
+            err_msg = parsed.get('error', "Unknown error during parsing") if parsed else "Failed to parse URL (parser returned None)"
+            QMessageBox.critical(self, "URL Parse Error", f"Could not parse URL: {err_msg}")
+            return
+
+        display_name = data['name']
+        if not display_name:
+            try:
+                host = urlparse(parsed['server_base_url']).hostname or "host"
+                display_name = f"{host}_{parsed['username']}"
+            except Exception as e:
+                logging.warning(
+                    f"Error auto-generating display name for URL '{data['url']}': {e}. "
+                    f"Details - Parsed server: '{parsed.get('server_base_url', 'N/A')}', "
+                    f"Parsed user: '{parsed.get('username', 'N/A')}'. Using fallback name."
+                )
+                username_for_fallback = str(parsed.get('username', ''))
+                display_name = f"Imported_{username_for_fallback}"
+
+        try:
+            add_entry(display_name, data['category'], parsed['server_base_url'], parsed['username'], parsed['password'])
+            QMessageBox.information(self, "Success", f"Entry '{display_name}' imported.")
+            self.accept()
+        except Exception as e:
+            logging.error(f"Error adding imported entry: {e}")
+            QMessageBox.critical(self, "Database Error", f"Could not save imported entry: {e}")
+
+class BatchImportOptionsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent); self.setWindowTitle("Batch Import Options"); self.setWindowModality(Qt.WindowModal)
+        layout = QVBoxLayout(self); form_layout = QFormLayout(); self.category_combo = QComboBox(); self.populate_categories()
+        form_layout.addRow("Assign to Category:", self.category_combo); layout.addLayout(form_layout); self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept); self.button_box.rejected.connect(self.reject); layout.addWidget(self.button_box)
+    def populate_categories(self):
+        self.category_combo.clear()
+        try:
+            cats = get_all_categories(); self.category_combo.addItems(cats if cats else ["Uncategorized"]); uncat_idx = self.category_combo.findText("Uncategorized")
+            if uncat_idx != -1: self.category_combo.setCurrentIndex(uncat_idx)
+        except Exception as e: logging.error(f"BatchImportOptionsDialog: Failed to populate categories: {e}"); self.category_combo.addItem("Uncategorized")
+    def get_selected_category(self): return self.category_combo.currentText()
+
+
+# =============================================================================
+# API CHECKER WORKER
+# =============================================================================
+class ApiCheckerWorker(QObject):
+    result_ready = Signal(int, dict)
+    status_message_updated = Signal(str)
+    progress_updated = Signal(int, int)
+    batch_finished = Signal()
+    session_initialized_signal = Signal() # Signal that session is ready
+
+    def __init__(self):
+        super().__init__()
+        self._session = None
+        self._is_running = True
+
+    @Slot()
+    def initialize_session(self):
+        if not self._session:
+            try:
+                logging.info("API Worker: Initializing session...")
+                self._session = requests.Session()
+                logging.info("API Worker: Session initialized.")
+                self.session_initialized_signal.emit() # Notify that session is ready
+            except Exception as e:
+                logging.error(f"API Worker: Failed to initialize session: {e}")
+                # Optionally, emit a failure signal or handle error
+                self.status_message_updated.emit("Error: Could not initialize network session.")
+                self._is_running = False # Stop further processing if session fails
+
+    @Slot()
+    def stop_processing(self):
+        self._is_running = False
+        logging.info("API Worker: Stop requested.")
+
+    def run_checks(self, entry_ids_to_check):
+        # Session initialization is now typically called before run_checks
+        # or we wait for session_initialized_signal if initialize_session is called by thread.started
+        if not self._session:
+            # This case should ideally be handled by waiting for session_initialized_signal
+            # if initialize_session() is called asynchronously.
+            # For now, if called directly, ensure session is initialized.
+            self.initialize_session()
+            if not self._session: # If initialization failed
+                self.batch_finished.emit() # End the batch if session is not up
+                return
+
+        self._is_running = True
+        total = len(entry_ids_to_check)
+        processed_count = 0
+        logging.info(f"Worker checking {total} entries.")
+        # Emit initial progress immediately AFTER session is confirmed to be ready.
+        # If initialize_session is called by thread.started, this emit should be after session_initialized_signal is received.
+        # For this direct call structure, it's okay here if initialize_session() is blocking and successful.
+        self.progress_updated.emit(0, total)
+
+        for i, entry_id in enumerate(entry_ids_to_check):
+            if not self._is_running:
+                self.progress_updated.emit(processed_count, total) # Emit final processed count
+                self.status_message_updated.emit(f"API checking cancelled after {processed_count}/{total}.")
+                logging.info("API check cancelled by flag.")
+                break
+
+            # This message is good.
+            # self.status_message_updated.emit(f"Checking {i+1}/{total} (ID: {entry_id})...")
+            try:
+                entry_data = get_entry_by_id(entry_id)
+                if not entry_data:
+                    logging.warning(f"Worker: Entry ID {entry_id} not found.")
+                    self.result_ready.emit(entry_id, {'success': False, 'api_message': "Entry not found in DB"})
+                    processed_count += 1
+                    self.progress_updated.emit(processed_count, total)
+                    continue
+
+                # Actual API call
+                api_result = check_account_status_detailed_api(
+                    entry_data['server_base_url'],
+                    entry_data['username'],
+                    entry_data['password'],
+                    self._session
+                )
+                self.result_ready.emit(entry_id, api_result)
+                processed_count += 1
+                if REQUEST_DELAY_BETWEEN_CHECKS > 0:
+                    # This sleep helps the main thread process UI updates for the progress bar
+                    time.sleep(REQUEST_DELAY_BETWEEN_CHECKS)
+            except Exception as e:
+                logging.error(f"Worker: Error checking ID {entry_id}: {e}")
+                self.result_ready.emit(entry_id, {'success': False, 'api_message': f"Worker Error: {e.__class__.__name__}"})
+                processed_count += 1
+            finally:
+                # Update progress after each item attempt
+                self.progress_updated.emit(processed_count, total)
+                logging.debug(f"Worker progress: {processed_count}/{total}")
+
+
+        if self._is_running:
+            self.status_message_updated.emit(f"Finished checking {processed_count}/{total} entries.")
+
+        self.batch_finished.emit()
+
+    def cleanup_session(self):
+        if self._session:
+            self._session.close()
+            self._session = None
+            logging.info("API Worker: Session closed.")
+
+
+# =============================================================================
+# CUSTOM PROXY MODEL FOR FILTERING
+# =============================================================================
+COL_ID, COL_NAME, COL_CATEGORY, COL_STATUS, COL_EXPIRY, COL_TRIAL, \
+COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_MSG = range(12)
+
+class EntryFilterProxyModel(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._search_text = ""
+        self._exclude_na = False
+        self._na_strings = {"N/A", "INVALID", "NOT CHECKED", "NEVER"}
+
+    def set_search_text(self, text):
+        self._search_text = text.lower()
+        self.invalidateFilter()
+
+    def set_exclude_na(self, exclude):
+        self._exclude_na = exclude
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        search_match = True
+        if self._search_text:
+            search_match = False
+            search_columns = [COL_NAME, COL_CATEGORY, COL_STATUS, COL_SERVER, COL_USER, COL_MSG]
+            for col in search_columns:
+                idx = self.sourceModel().index(source_row, col, source_parent)
+                data = self.sourceModel().data(idx)
+                if data and self._search_text in str(data).lower():
+                    search_match = True
+                    break
+        if not search_match:
+            return False
+
+        if self._exclude_na:
+            na_check_columns = [COL_EXPIRY, COL_TRIAL, COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_STATUS]
+            for col in na_check_columns:
+                idx = self.sourceModel().index(source_row, col, source_parent)
+                data_str = str(self.sourceModel().data(idx)).upper()
+                if data_str in self._na_strings:
+                    return False
+        return True
+
+# =============================================================================
+# MAIN APPLICATION WINDOW
+# =============================================================================
+COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "Username", "Message"]
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.setGeometry(100, 100, 1280, 720)
+        self.current_category_filter = "All Categories"
+        self.api_worker = None
+        self.api_thread = None
+        self._is_checking_api = False
+        self.setup_ui()
+        self.load_entries_to_table()
+        self.update_category_filter_combo()
+        self.update_action_button_states()
+        # *** MODIFIED LINE ***
+        # Use the resource_path helper to find the icon, both in development and in the PyInstaller bundle.
+        self.setWindowIcon(QIcon(resource_path("icon.ico")))
+
+    def setup_ui(self):
+        menubar = self.menuBar(); file_menu = menubar.addMenu("&File")
+        import_url_action = QAction("Import from &URL...", self); import_url_action.triggered.connect(self.import_from_url_action); file_menu.addAction(import_url_action)
+        import_file_action = QAction("Import from &File...", self); import_file_action.triggered.connect(self.import_from_file_action); file_menu.addAction(import_file_action)
+        file_menu.addSeparator()
+        export_clipboard_action = QAction("Copy Link for Current Entry", self); export_clipboard_action.triggered.connect(self.export_current_to_clipboard); file_menu.addAction(export_clipboard_action)
+        export_txt_action = QAction("Export Links for Selected Entries...", self); export_txt_action.triggered.connect(self.export_selected_to_txt); file_menu.addAction(export_txt_action)
+        file_menu.addSeparator()
+        exit_action = QAction("&Exit", self); exit_action.setShortcut(QKeySequence.Quit); exit_action.triggered.connect(self.close); file_menu.addAction(exit_action)
+
+        main_widget = QWidget(); main_layout = QVBoxLayout(main_widget)
+
+        top_controls_layout = QHBoxLayout()
+        self.add_button = QPushButton("Add Entry"); self.edit_button = QPushButton("Edit Selected")
+        self.delete_button = QPushButton("Delete Selected")
+        self.import_url_button = QPushButton("Import URL"); self.import_file_button = QPushButton("Import File")
+
+        top_controls_layout.addWidget(self.add_button); top_controls_layout.addWidget(self.edit_button); top_controls_layout.addWidget(self.delete_button)
+        top_controls_layout.addSpacing(10); top_controls_layout.addWidget(self.import_url_button); top_controls_layout.addWidget(self.import_file_button)
+        top_controls_layout.addStretch(); main_layout.addLayout(top_controls_layout)
+
+        export_buttons_layout = QHBoxLayout()
+        self.export_clipboard_button = QPushButton("Copy Link (Current)"); export_buttons_layout.addWidget(self.export_clipboard_button)
+        self.export_txt_button = QPushButton("Export Links (Selected)"); export_buttons_layout.addWidget(self.export_txt_button)
+        export_buttons_layout.addStretch()
+        top_controls_layout.addSpacing(20)
+        top_controls_layout.addWidget(self.export_clipboard_button)
+        top_controls_layout.addWidget(self.export_txt_button)
+
+        secondary_controls_layout = QHBoxLayout()
+        self.check_selected_button = QPushButton("Check Selected"); self.check_all_button = QPushButton("Check All Visible")
+        self.manage_categories_button = QPushButton("Categories...")
+        secondary_controls_layout.addWidget(self.check_selected_button); secondary_controls_layout.addWidget(self.check_all_button)
+        secondary_controls_layout.addStretch(); secondary_controls_layout.addWidget(self.manage_categories_button); main_layout.addLayout(secondary_controls_layout)
+
+        filter_controls_layout = QHBoxLayout()
+        filter_controls_layout.addWidget(QLabel("Search:"))
+        self.search_edit = QLineEdit(); self.search_edit.setPlaceholderText("Type to search..."); filter_controls_layout.addWidget(self.search_edit)
+        filter_controls_layout.addSpacing(10)
+        filter_controls_layout.addWidget(QLabel("Category:"))
+        self.category_filter_combo = QComboBox(); self.category_filter_combo.setMinimumWidth(150); filter_controls_layout.addWidget(self.category_filter_combo)
+        self.exclude_na_button = QPushButton("Exclude N/A"); self.exclude_na_button.setCheckable(True); filter_controls_layout.addWidget(self.exclude_na_button)
+        filter_controls_layout.addStretch(); main_layout.addLayout(filter_controls_layout)
+
+        self.table_view = QTableView(); self.table_model = QStandardItemModel(0, len(COLUMN_HEADERS))
+        self.table_model.setHorizontalHeaderLabels(COLUMN_HEADERS);
+        self.proxy_model = EntryFilterProxyModel(self)
+        self.proxy_model.setSourceModel(self.table_model); self.table_view.setModel(self.proxy_model)
+
+        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows); self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table_view.setEditTriggers(QAbstractItemView.NoEditTriggers); self.table_view.setSortingEnabled(True)
+        self.table_view.sortByColumn(COL_NAME, Qt.AscendingOrder); header = self.table_view.horizontalHeader()
+        header.setSectionResizeMode(COL_ID, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_NAME, QHeaderView.Interactive); self.table_view.setColumnWidth(COL_NAME, 200)
+        header.setSectionResizeMode(COL_CATEGORY, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_EXPIRY, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_TRIAL, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_ACTIVE_CONN, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_MAX_CONN, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_LAST_CHECKED, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_SERVER, QHeaderView.Interactive); self.table_view.setColumnWidth(COL_SERVER, 150)
+        header.setSectionResizeMode(COL_USER, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_MSG, QHeaderView.Stretch)
+        main_layout.addWidget(self.table_view); self.setCentralWidget(main_widget)
+        self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
+        self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False); self.progress_bar.setTextVisible(True)
+        self.status_bar.addPermanentWidget(self.progress_bar)
+
+        self.add_button.clicked.connect(self.add_entry_action); self.edit_button.clicked.connect(self.edit_entry_action)
+        self.delete_button.clicked.connect(self.delete_entry_action); self.import_url_button.clicked.connect(self.import_from_url_action)
+        self.import_file_button.clicked.connect(self.import_from_file_action); self.manage_categories_button.clicked.connect(self.manage_categories_action)
+        self.check_selected_button.clicked.connect(self.check_selected_entries_action); self.check_all_button.clicked.connect(self.check_all_entries_action)
+        self.export_clipboard_button.clicked.connect(self.export_current_to_clipboard)
+        self.export_txt_button.clicked.connect(self.export_selected_to_txt)
+
+        self.table_view.doubleClicked.connect(self.edit_entry_action)
+        self.category_filter_combo.currentTextChanged.connect(self.category_filter_changed)
+        self.search_edit.textChanged.connect(self.on_search_text_changed)
+        self.exclude_na_button.toggled.connect(self.on_exclude_na_toggled)
+
+        self.table_view.selectionModel().selectionChanged.connect(self.update_action_button_states)
+        self.table_view.selectionModel().currentChanged.connect(self.update_action_button_states)
+
+    def update_category_filter_combo(self):
+        cur_sel = self.category_filter_combo.currentText(); self.category_filter_combo.blockSignals(True)
+        self.category_filter_combo.clear(); self.category_filter_combo.addItem("All Categories")
+        try: self.category_filter_combo.addItems(get_all_categories())
+        except Exception as e: logging.error(f"Failed to populate category filter: {e}")
+        idx = self.category_filter_combo.findText(cur_sel); self.category_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
+        self.category_filter_combo.blockSignals(False)
+
+    @Slot(str)
+    def category_filter_changed(self, cat_name):
+        self.current_category_filter = cat_name;
+        self.load_entries_to_table()
+
+    @Slot(str)
+    def on_search_text_changed(self, text):
+        self.proxy_model.set_search_text(text)
+
+    @Slot(bool)
+    def on_exclude_na_toggled(self, checked):
+        self.proxy_model.set_exclude_na(checked)
+
+    def load_entries_to_table(self):
+        self.table_model.removeRows(0, self.table_model.rowCount())
+        try:
+            for row_data in get_all_entries(category_filter=self.current_category_filter): self.table_model.appendRow(self.create_row_items(row_data))
+        except Exception as e: logging.error(f"Error loading entries: {e}"); QMessageBox.critical(self, "Load Error", f"Could not load: {e}")
+        self.proxy_model.invalidateFilter()
+
+    def create_row_items(self, entry_data):
+        items = []; id_item = QStandardItem(str(entry_data['id'])); id_item.setData(entry_data['id'], Qt.UserRole); items.append(id_item)
+        items.append(QStandardItem(entry_data['name'])); items.append(QStandardItem(entry_data['category']))
+        status_val = entry_data['api_status'] if entry_data['api_status'] is not None else "Not Checked"
+        status_item = QStandardItem(status_val); self.apply_status_coloring(status_item, status_val); items.append(status_item)
+        items.append(QStandardItem(format_timestamp_display(entry_data['expiry_date_ts'])))
+        items.append(QStandardItem(format_trial_status_display(entry_data['is_trial'])))
+        active_c = entry_data['active_connections']; items.append(QStandardItem(str(active_c) if active_c is not None else "N/A"))
+        max_c = entry_data['max_connections']; items.append(QStandardItem(str(max_c) if max_c is not None else "N/A"))
+        last_chk_raw = entry_data['last_checked_at']; last_chk_disp = "Never"
+        if last_chk_raw:
+            try:
+                dt_utc = QDateTime.fromString(last_chk_raw.split('.')[0], Qt.ISODate).toUTC()
+                if not dt_utc.isValid() : dt_utc = QDateTime.fromString(last_chk_raw, Qt.ISODateWithMs).toUTC()
+                dt_local = dt_utc.toLocalTime(); last_chk_disp = dt_local.toString("yyyy-MM-dd hh:mm")
+            except Exception as e: logging.warning(f"Error parsing last_checked_at '{last_chk_raw}': {e}")
+        items.append(QStandardItem(last_chk_disp)); items.append(QStandardItem(entry_data['server_base_url']))
+        items.append(QStandardItem(entry_data['username']))
+        api_msg = entry_data['api_message'] if entry_data['api_message'] is not None else ""
+        items.append(QStandardItem(api_msg))
+        return items
+
+    def apply_status_coloring(self, item, status_text):
+        s_lower = str(status_text).lower(); color = QColor("gray")
+        if "active" in s_lower: color = QColor("darkGreen")
+        elif "expired" in s_lower: color = QColor("orange")
+        elif "banned" in s_lower or "disabled" in s_lower: color = QColor("red")
+        elif "auth failed" in s_lower: color = QColor(139,0,0)
+        elif "error" in s_lower or "failed" in s_lower and "auth failed" not in s_lower : color = QColor("magenta")
+        item.setForeground(color)
+
+    @Slot()
+    def update_action_button_states(self):
+        selection_model = self.table_view.selectionModel()
+        has_selection = selection_model.hasSelection()
+        selected_row_count = len(selection_model.selectedRows(0))
+
+        can_interact = not self._is_checking_api
+
+        self.edit_button.setEnabled(selected_row_count == 1 and can_interact)
+        self.delete_button.setEnabled(has_selection and can_interact)
+        self.check_selected_button.setEnabled(has_selection and can_interact)
+        self.export_txt_button.setEnabled(has_selection and can_interact)
+
+        self.check_all_button.setEnabled(self.proxy_model.rowCount() > 0 and can_interact)
+
+        current_proxy_index = self.table_view.currentIndex()
+        is_valid_current_item = current_proxy_index.isValid() and current_proxy_index.row() >= 0
+        self.export_clipboard_button.setEnabled(is_valid_current_item and can_interact)
+
+        self.add_button.setEnabled(can_interact)
+        self.import_url_button.setEnabled(can_interact)
+        self.import_file_button.setEnabled(can_interact)
+        self.manage_categories_button.setEnabled(can_interact)
+
+        self.category_filter_combo.setEnabled(can_interact)
+        self.search_edit.setEnabled(can_interact)
+        self.exclude_na_button.setEnabled(can_interact)
+
+
+    @Slot()
+    def add_entry_action(self):
+        diag = EntryDialog(parent=self)
+        if diag.exec(): self.load_entries_to_table(); self.update_category_filter_combo()
+
+    @Slot()
+    def edit_entry_action(self):
+        current_proxy_index = self.table_view.currentIndex()
+        if not current_proxy_index.isValid():
+            sel_proxied = self.table_view.selectionModel().selectedRows(COL_ID)
+            if not sel_proxied: return
+            current_proxy_index = sel_proxied[0]
+
+        src_idx = self.proxy_model.mapToSource(current_proxy_index)
+        entry_id_item = self.table_model.itemFromIndex(src_idx.siblingAtColumn(COL_ID))
+        if not entry_id_item: return
+        entry_id = entry_id_item.data(Qt.UserRole)
+
+        diag = EntryDialog(entry_id=entry_id, parent=self)
+        if diag.exec(): self.refresh_row_by_id(entry_id); self.update_category_filter_combo()
+
+    @Slot()
+    def delete_entry_action(self):
+        sel_proxied = self.table_view.selectionModel().selectedRows(COL_ID)
+        if not sel_proxied: return
+        reply = QMessageBox.question(self, "Confirm Delete", f"Delete {len(sel_proxied)} selected entry(s)?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            ids_del = []
+            for proxy_idx in sel_proxied:
+                src_idx = self.proxy_model.mapToSource(proxy_idx)
+                id_item = self.table_model.itemFromIndex(src_idx.siblingAtColumn(COL_ID))
+                if id_item: ids_del.append(id_item.data(Qt.UserRole))
+
+            for entry_id in ids_del:
+                try: delete_entry(entry_id)
+                except Exception as e: QMessageBox.warning(self, "Delete Error", f"Could not delete ID {entry_id}: {e}")
+            self.load_entries_to_table()
+
+    @Slot()
+    def manage_categories_action(self):
+        diag = ManageCategoriesDialog(parent=self)
+        diag.exec()
+        self.load_entries_to_table()
+        self.update_category_filter_combo()
+
+    @Slot()
+    def import_from_url_action(self):
+        dialog = ImportUrlDialog(parent=self)
+        if dialog.exec():
+            self.load_entries_to_table(); self.update_category_filter_combo()
+
+    @Slot()
+    def import_from_file_action(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Text File with URLs", "", "Text Files (*.txt);;All Files (*)")
+        if not file_path: return
+        options_dialog = BatchImportOptionsDialog(parent=self)
+        if not options_dialog.exec(): return
+        default_category = options_dialog.get_selected_category(); imported_count = 0; failed_count = 0
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line_num, line in enumerate(f, 1):
+                    url_string = line.strip()
+                    if not url_string or url_string.startswith('#'): continue
+                    parsed_info = parse_get_php_url(url_string)
+                    if parsed_info and not parsed_info.get('error'):
+                        try:
+                            host = urlparse(parsed_info['server_base_url']).hostname or "host"; display_name = f"{host}_{parsed_info['username']}_L{line_num}"
+                            add_entry(display_name, default_category, parsed_info['server_base_url'], parsed_info['username'], parsed_info['password'])
+                            imported_count += 1
+                        except Exception as db_e: logging.error(f"Batch Import: DB error for URL '{url_string}': {db_e}"); failed_count += 1
+                    else: logging.warning(f"Batch Import: Failed to parse URL on line {line_num}: {url_string} - {parsed_info.get('error', 'Unknown') if parsed_info else 'None'}"); failed_count += 1
+            QMessageBox.information(self, "Batch Import Complete", f"Imported: {imported_count}\nFailed: {failed_count}\nSee log for details.")
+            if imported_count > 0: self.load_entries_to_table(); self.update_category_filter_combo()
+        except IOError as e: logging.error(f"Error reading import file '{file_path}': {e}"); QMessageBox.critical(self, "File Error", f"Could not read file: {e}")
+        except Exception as e_gen: logging.error(f"Unexpected error during batch import: {e_gen}"); QMessageBox.critical(self, "Import Error", f"Unexpected error: {e_gen}")
+
+    def get_entry_data_for_export(self, proxy_index):
+        if not proxy_index.isValid(): return None
+        source_index = self.proxy_model.mapToSource(proxy_index)
+        entry_id_item = self.table_model.itemFromIndex(source_index.siblingAtColumn(COL_ID))
+        if not entry_id_item: return None
+
+        entry_id = entry_id_item.data(Qt.UserRole)
+        entry = get_entry_by_id(entry_id)
+        if entry:
+            return f"{entry['server_base_url']}/get.php?username={entry['username']}&password={entry['password']}&type=m3u_plus&output=ts"
+        return None
+
+    @Slot()
+    def export_current_to_clipboard(self):
+        current_proxy_index = self.table_view.currentIndex()
+        m3u_link = self.get_entry_data_for_export(current_proxy_index)
+        if m3u_link:
+            QGuiApplication.clipboard().setText(m3u_link)
+            self.status_bar.showMessage("M3U link copied to clipboard.", 3000)
+        else:
+            QMessageBox.warning(self, "Export Error", "Could not get data for the current entry.")
+
+    @Slot()
+    def export_selected_to_txt(self):
+        selected_proxy_indexes = self.table_view.selectionModel().selectedRows()
+        if not selected_proxy_indexes:
+            QMessageBox.information(self, "Export", "No entries selected.")
+            return
+
+        m3u_links = []
+        for proxy_idx in selected_proxy_indexes:
+            link = self.get_entry_data_for_export(proxy_idx)
+            if link: m3u_links.append(link)
+
+        if not m3u_links:
+            QMessageBox.warning(self, "Export Error", "Could not get data for any selected entries.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Exported Links", "", "Text Files (*.txt);;All Files (*)")
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    for link in m3u_links: f.write(link + "\n")
+                self.status_bar.showMessage(f"{len(m3u_links)} links exported to {os.path.basename(file_path)}.", 5000)
+                QMessageBox.information(self, "Export Successful", f"{len(m3u_links)} M3U links exported to:\n{file_path}")
+            except IOError as e:
+                logging.error(f"Error writing export file '{file_path}': {e}")
+                QMessageBox.critical(self, "File Error", f"Could not write to file: {e}")
+
+
+    def get_selected_entry_ids(self):
+        ids = []
+        # A bit of logging to see how long this takes if it's an issue
+        logging.debug("Getting selected entry IDs...")
+        start_time = time.perf_counter()
+        for proxy_idx in self.table_view.selectionModel().selectedRows(COL_ID): # Specify column for row indexes
+            src_idx = self.proxy_model.mapToSource(proxy_idx)
+            id_item = self.table_model.itemFromIndex(src_idx) # Use src_idx directly if it's for COL_ID
+            if id_item: ids.append(id_item.data(Qt.UserRole))
+        end_time = time.perf_counter()
+        logging.debug(f"Got {len(ids)} selected IDs in {end_time - start_time:.4f} seconds.")
+        return ids
+
+    def get_all_visible_entry_ids(self):
+        ids = []
+        logging.debug("Getting all visible entry IDs...")
+        start_time = time.perf_counter()
+        for row in range(self.proxy_model.rowCount()):
+            proxy_idx = self.proxy_model.index(row, COL_ID)
+            src_idx = self.proxy_model.mapToSource(proxy_idx)
+            id_item = self.table_model.itemFromIndex(src_idx)
+            if id_item: ids.append(id_item.data(Qt.UserRole))
+        end_time = time.perf_counter()
+        logging.debug(f"Got {len(ids)} visible IDs in {end_time - start_time:.4f} seconds.")
+        return ids
+
+    @Slot()
+    def check_selected_entries_action(self):
+        ids = self.get_selected_entry_ids()
+        if ids: self.start_api_checks(ids)
+
+    @Slot()
+    def check_all_entries_action(self):
+        ids = self.get_all_visible_entry_ids()
+        if ids: self.start_api_checks(ids)
+
+    def start_api_checks(self, entry_ids):
+        if self._is_checking_api:
+            QMessageBox.warning(self, "Busy", "API check already in progress.")
+            return
+
+        self._is_checking_api = True
+        num_entries = len(entry_ids)
+
+        # --- UI Updates on Main Thread BEFORE starting thread ---
+        self.progress_bar.setRange(0, num_entries)
+        self.progress_bar.setValue(0) # Set to 0 before showing
+        self.progress_bar.setFormat("%v / %m (%p%)")
+        self.progress_bar.setVisible(True) # Make visible NOW
+        self.status_bar.showMessage(f"Starting API checks for {num_entries} entries...")
+        self.update_action_button_states() # Disable buttons
+        QApplication.processEvents() # Try to force immediate UI update
+        # --- End UI Updates on Main Thread ---
+
+        logging.debug("Creating API thread and worker.")
+        self.api_thread = QThread(self) # Pass parent to QThread for potential lifecycle mgt
+        self.api_worker = ApiCheckerWorker()
+
+        # Connect session_initialized_signal from worker
+        # This ensures run_checks is called only after the session is ready in the worker's thread
+        self.api_worker.session_initialized_signal.connect(
+            lambda: self.api_worker.run_checks(list(entry_ids)) # Pass a copy
+        )
+
+        self.api_worker.moveToThread(self.api_thread)
+
+        self.api_worker.result_ready.connect(self.handle_api_result)
+        self.api_worker.status_message_updated.connect(self.status_bar.showMessage)
+        self.api_worker.progress_updated.connect(self.update_progress_bar_values)
+        self.api_worker.batch_finished.connect(self.on_api_worker_batch_finished)
+
+        # The worker's run_checks will be triggered by session_initialized_signal
+        # We now trigger initialize_session when the thread starts.
+        self.api_thread.started.connect(self.api_worker.initialize_session)
+
+        self.api_thread.finished.connect(self.api_worker.cleanup_session)
+        self.api_thread.finished.connect(self.api_worker.deleteLater)
+        self.api_thread.finished.connect(self.api_thread.deleteLater)
+        self.api_thread.finished.connect(self._clear_thread_references)
+
+        logging.debug("Starting API thread.")
+        self.api_thread.start()
+        logging.debug("start_api_checks method finished on main thread.")
+
+
+    @Slot(int, int)
+    def update_progress_bar_values(self, current_val, total_val):
+        logging.debug(f"Main Thread: Received progress update: {current_val}/{total_val}")
+        if self.progress_bar.maximum() != total_val:
+            self.progress_bar.setMaximum(total_val)
+        self.progress_bar.setValue(current_val)
+        # No processEvents() here, let Qt handle it unless flickering persists badly.
+
+    # set_buttons_enabled_during_check is removed as update_action_button_states handles it.
+
+    @Slot(int, dict)
+    def handle_api_result(self, entry_id, result_data):
+        logging.debug(f"GUI received API result for ID {entry_id}: {result_data.get('api_status', 'N/A')}")
+        try:
+            update_entry_status(entry_id, result_data)
+            self.refresh_row_by_id(entry_id)
+        except Exception as e:
+            logging.error(f"Error handling API result for ID {entry_id} in GUI: {e}")
+
+    def refresh_row_by_id(self, entry_id):
+        entry_data = get_entry_by_id(entry_id)
+        if not entry_data: return
+
+        new_row_items = self.create_row_items(entry_data)
+
+        for row in range(self.table_model.rowCount()):
+            source_id_item = self.table_model.item(row, COL_ID)
+            if source_id_item and source_id_item.data(Qt.UserRole) == entry_id:
+                for col, item_data in enumerate(new_row_items):
+                    existing_item = self.table_model.item(row, col)
+                    if existing_item:
+                        existing_item.setText(item_data.text())
+                        if col == COL_ID: existing_item.setData(item_data.data(Qt.UserRole), Qt.UserRole)
+                        if col == COL_STATUS: self.apply_status_coloring(existing_item, item_data.text())
+                    else:
+                        self.table_model.setItem(row, col, item_data)
+                self.proxy_model.invalidateFilter()
+                return
+        logging.warning(f"Could not find row for ID {entry_id} to refresh directly in source model, or it's filtered. Proxy will update.")
+        self.proxy_model.invalidateFilter()
+
+    @Slot()
+    def _clear_thread_references(self):
+        logging.info("QThread.finished received. Clearing Python references and re-enabling UI.")
+
+        self.api_worker = None
+        self.api_thread = None
+        self._is_checking_api = False
+
+        self.progress_bar.setVisible(False)
+        self.update_action_button_states()
+        self.status_bar.showMessage("API checks fully completed.", 5000)
+
+
+    @Slot()
+    def on_api_worker_batch_finished(self):
+        # Worker's internal processing loop has finished.
+        # Status bar would have been updated by the worker with "Finished checking X/Y entries."
+
+        if self.api_worker:
+            self.api_worker.stop_processing() # Ensure its _is_running flag is false
+
+        if self.api_thread:
+            logging.info("Worker batch finished. Requesting QThread to quit its event loop.")
+            self.api_thread.quit()
+
+        logging.info("API Worker batch processing finished. Waiting for QThread.finished for full cleanup and UI reset.")
+
+
+    def closeEvent(self, event):
+        if self._is_checking_api:
+            reply = QMessageBox.question(self, "Confirm Exit", "API checks in progress. Exit anyway?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                logging.info("User chose to exit during API checks.")
+                if self.api_worker:
+                    self.api_worker.stop_processing()
+                if self.api_thread:
+                    self.api_thread.quit()
+                event.accept()
+            else:
+                event.ignore()
+                return
+        else:
+            event.accept()
+        logging.info(f"{APP_NAME} closing.")
+
+# =============================================================================
+# APPLICATION ENTRY POINT
+# =============================================================================
+if __name__ == "__main__":
+    logging.getLogger().setLevel(logging.DEBUG)
+    logging.info("Application starting with DEBUG level logging.")
+
+    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+
+    if not initialize_database():
+        QMessageBox.critical(None, "Startup Error", f"Failed to initialize the database ({DATABASE_NAME}).\nSee log: {LOG_FILE}\nApplication will exit.")
+        sys.exit(1)
+
+    main_window = MainWindow()
+    main_window.show()
+    sys.exit(app.exec())
+

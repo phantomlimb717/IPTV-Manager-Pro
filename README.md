@@ -19,8 +19,6 @@ You can download the latest pre-compiled application for Windows from the offici
 
 No installation is required. Simply download the `IPTV Manager v0.2.4.exe` file and run it.
 
-Mac & Linux versions coming soon!
-
 ## Usage
 
 1.  Download `IPTV Manager v0.2.4.exe` from the latest release.

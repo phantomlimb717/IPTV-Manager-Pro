@@ -1450,7 +1450,13 @@ class MainWindow(QMainWindow):
         if not file_path: return
         options_dialog = BatchImportOptionsDialog(parent=self)
         if not options_dialog.exec(): return
-        default_category = options_dialog.get_selected_category(); imported_count = 0; failed_count = 0
+        default_category = options_dialog.get_selected_category()
+        imported_count = 0
+        failed_count = 0
+
+        current_stalker_portal_url_for_mac_list = None
+        mac_pattern = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 for line_num, line in enumerate(f, 1):
@@ -1458,55 +1464,87 @@ class MainWindow(QMainWindow):
                     if not line_content or line_content.startswith('#'):
                         continue
 
-                    if line_content.startswith("stalker_portal:"):
+                    is_stalker_credential_string = line_content.startswith("stalker_portal:")
+                    is_xc_link = "get.php?" in line_content
+                    # Check for MAC pattern first, as URLs can be short and might be misidentified by simple http check alone
+                    is_potential_mac = mac_pattern.fullmatch(line_content) is not None # Use fullmatch for MAC
+
+                    # A line is a potential portal URL if it starts with http/https, is NOT an XC link, AND NOT a stalker credential string
+                    is_potential_portal_url = (line_content.startswith("http://") or line_content.startswith("https://")) \
+                                               and not is_xc_link and not is_stalker_credential_string
+
+                    if is_stalker_credential_string:
+                        current_stalker_portal_url_for_mac_list = None # Reset context
                         try:
-                            # Format: stalker_portal:{PORTAL_URL},mac:{MAC_ADDRESS}
                             parts = line_content.split(',')
-                            portal_part_full = parts[0].strip() # stalker_portal:http://...
-                            mac_part_full = parts[1].strip()    # mac:00:1A:...
+                            if len(parts) < 2: raise ValueError("Malformed stalker string, missing comma.")
+                            portal_part_full = parts[0].strip()
+                            mac_part_full = parts[1].strip()
 
                             if not portal_part_full.startswith("stalker_portal:") or not mac_part_full.startswith("mac:"):
-                                raise ValueError("Malformed stalker string")
+                                raise ValueError("Malformed stalker string, missing prefixes.")
 
                             portal_url = portal_part_full.replace("stalker_portal:", "").strip()
                             mac_address = mac_part_full.replace("mac:", "").strip().upper()
 
                             if not (portal_url.startswith("http://") or portal_url.startswith("https://")):
-                                logging.warning(f"Batch Import: Invalid Stalker portal URL on line {line_num}: {portal_url}"); failed_count += 1; continue
+                                logging.warning(f"Batch Import: Invalid Stalker portal URL in string on line {line_num}: {portal_url}"); failed_count += 1; continue
+                            if not mac_pattern.fullmatch(mac_address): # Re-check MAC after parsing
+                                logging.warning(f"Batch Import: Invalid Stalker MAC address in string on line {line_num}: {mac_address}"); failed_count += 1; continue
 
-                            mac_pattern = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
-                            if not mac_pattern.match(mac_address):
-                                logging.warning(f"Batch Import: Invalid Stalker MAC address on line {line_num}: {mac_address}"); failed_count += 1; continue
-
-                            # Auto-generate display name
                             parsed_p_url = urlparse(portal_url)
                             host = parsed_p_url.hostname or "stalker_host"
                             display_name = f"{host}_{mac_address.replace(':', '')}_L{line_num}"
-
-                            # For Stalker, server_base_url is derived, username/password are blank
                             server_base_url = f"{parsed_p_url.scheme}://{parsed_p_url.netloc}" if parsed_p_url.scheme and parsed_p_url.netloc else portal_url
-
-                            add_entry(display_name, default_category, server_base_url, "", "",
-                                      account_type='stalker', mac_address=mac_address, portal_url=portal_url)
+                            add_entry(display_name, default_category, server_base_url, "", "", account_type='stalker', mac_address=mac_address, portal_url=portal_url)
                             imported_count += 1
-                            logging.info(f"Batch Import: Successfully imported Stalker entry from line {line_num}")
-                        except Exception as e_stalker:
-                            logging.error(f"Batch Import: Error processing Stalker line {line_num} ('{line_content}'): {e_stalker}"); failed_count += 1
+                            logging.info(f"Batch Import: Successfully imported Stalker credential string from line {line_num}")
+                        except Exception as e_stalker_str:
+                            logging.error(f"Batch Import: Error processing Stalker credential string on line {line_num} ('{line_content}'): {e_stalker_str}"); failed_count += 1
 
-                    elif "get.php?" in line_content: # Existing XC API logic
+                    elif is_xc_link:
+                        current_stalker_portal_url_for_mac_list = None # Reset context
                         parsed_info = parse_get_php_url(line_content)
                         if parsed_info and not parsed_info.get('error'):
                             try:
                                 host = urlparse(parsed_info['server_base_url']).hostname or "host"
                                 display_name = f"{host}_{parsed_info['username']}_L{line_num}"
-                                add_entry(display_name, default_category, parsed_info['server_base_url'], parsed_info['username'], parsed_info['password']) # Defaults to account_type='xc'
+                                add_entry(display_name, default_category, parsed_info['server_base_url'], parsed_info['username'], parsed_info['password'])
                                 imported_count += 1
                             except Exception as db_e: logging.error(f"Batch Import: DB error for XC URL on line {line_num} ('{line_content}'): {db_e}"); failed_count += 1
                         else:
                             logging.warning(f"Batch Import: Failed to parse XC URL on line {line_num}: {line_content} - {parsed_info.get('error', 'Unknown') if parsed_info else 'None'}"); failed_count += 1
+
+                    elif is_potential_portal_url: # Must be checked AFTER specific formats (XC, stalker_portal:)
+                        parsed_val_url = urlparse(line_content)
+                        if parsed_val_url.scheme and parsed_val_url.netloc: # Basic validation
+                            current_stalker_portal_url_for_mac_list = line_content
+                            logging.info(f"Batch Import: Set current Stalker portal URL for subsequent MACs to: {current_stalker_portal_url_for_mac_list} (from line {line_num})")
+                        else:
+                            logging.warning(f"Batch Import: Skipped potential URL (malformed or unsupported) on line {line_num}: {line_content}")
+                            # current_stalker_portal_url_for_mac_list = None # Keep previous context or reset? Let's keep for now.
+                            failed_count +=1
+
+                    elif is_potential_mac and current_stalker_portal_url_for_mac_list:
+                        mac_address = line_content.strip().upper() # Already validated by is_potential_mac basically
+                        portal_url = current_stalker_portal_url_for_mac_list
+                        try:
+                            parsed_p_url = urlparse(portal_url)
+                            host = parsed_p_url.hostname or "stalker_host"
+                            display_name = f"{host}_{mac_address.replace(':', '')}_L{line_num}"
+                            server_base_url = f"{parsed_p_url.scheme}://{parsed_p_url.netloc}" if parsed_p_url.scheme and parsed_p_url.netloc else portal_url
+                            add_entry(display_name, default_category, server_base_url, "", "", account_type='stalker', mac_address=mac_address, portal_url=portal_url)
+                            imported_count += 1
+                            logging.info(f"Batch Import: Successfully imported Stalker MAC {mac_address} for portal {portal_url} from line {line_num}")
+                        except Exception as e_mac_list:
+                            logging.error(f"Batch Import: Error processing MAC {mac_address} for portal {portal_url} on line {line_num}: {e_mac_list}"); failed_count += 1
+
                     else:
-                        logging.warning(f"Batch Import: Skipped unrecognized line {line_num}: {line_content[:100]}...") # Log first 100 chars
-                        failed_count +=1 # Consider if this should be counted as failure or just skipped
+                        if is_potential_mac and not current_stalker_portal_url_for_mac_list:
+                            logging.warning(f"Batch Import: Skipped MAC address {line_content} on line {line_num} as no Stalker Portal URL was previously defined in a block.")
+                        else:
+                            logging.warning(f"Batch Import: Skipped unrecognized line {line_num}: {line_content[:100]}...")
+                        failed_count += 1
 
             QMessageBox.information(self, "Batch Import Complete", f"Imported: {imported_count}\nFailed/Skipped: {failed_count}\nSee log for details.")
             if imported_count > 0: self.load_entries_to_table(); self.update_category_filter_combo()

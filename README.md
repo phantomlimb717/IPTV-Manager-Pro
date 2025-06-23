@@ -36,9 +36,18 @@ No installation is required. Simply download the `IPTV Manager v0.2.4.exe` file 
         *   **Xtream Codes API:** Enter Server URL, Username, and Password.
         *   **Stalker Portal:** Enter Portal URL (e.g., `http://portal.example.com:8080/c/`) and the MAC Address for the device (format: `XX:XX:XX:XX:XX:XX`).
     *   `Import URL` is for single Xtream Codes API `get.php` links.
-    *   `Import File` can be used to batch import:
-        *   Xtream Codes API links (one `get.php` URL per line).
-        *   Stalker Portal credentials (one entry per line, format: `stalker_portal:YOUR_PORTAL_URL,mac:YOUR_MAC_ADDRESS`).
+    *   `Import File` can be used to batch import entries. Supported formats per line:
+        *   **Xtream Codes API:** `http://server:port/get.php?username=USER&password=PASS...`
+        *   **Stalker Portal (Self-contained):** `stalker_portal:PORTAL_URL,mac:MAC_ADDRESS`
+        *   **Stalker Portal (URL followed by MACs):**
+            ```
+            http://your-stalker-portal.com:8080/c/  // This URL applies to MACs below
+            00:1A:79:XX:XX:XA
+            00:1A:79:XX:XX:XB
+            // Another portal URL would reset the context for subsequent MACs
+            http://another-portal.com
+            00:1A:79:YY:YY:YA
+            ```
 4.  Select accounts and use the `Check Selected` or `Check All Visible` buttons to refresh their status from the provider's API (*note*: `Check All Visible` will take a while if you have many playlists).
 5.  Use "Copy Link (Current)" or "Export Links (Selected)" to get account data:
     *   For Xtream Codes API entries, this will be the M3U playable link.

@@ -10,11 +10,16 @@ A desktop application for managing and checking the status of IPTV account crede
 - **Support for Multiple Account Types:**
     - **Xtream Codes API:** The original supported type, using server URL, username, and password.
     - **Stalker Portal:** Add accounts using Portal URL and MAC Address. Status checking will verify MAC activation and expiry.
-- **Batch Import (Xtream Codes API):** Import multiple Xtream Codes API accounts at once from M3U `get.php` style URLs, either from a single URL or from a text file.
+- **Batch Import:** Import multiple accounts from a text file. Supports:
+    - Xtream Codes API `get.php` style URLs.
+    - Stalker Portal credentials in the format `stalker_portal:URL,mac:MAC_ADDRESS`.
 - **Status Checking:** Check account status (including expiry date, active/max connections for Xtream Codes API) for both Xtream Codes and Stalker Portal type accounts.
 - **Categorization:** Organize your entries into custom categories.
 - **Advanced Filtering:** Quickly search the list by any field and filter by category.
-- **Export Links (Xtream Codes API):** Copy individual M3U links or export links for selected Xtream Codes API entries to a text file for use in other IPTV players. (Note: M3U link generation/export for Stalker Portals is not currently supported in this manner).
+- **Export Data:**
+    - **Copy to Clipboard:** Copies Xtream Codes M3U links or Stalker Portal credential strings (`stalker_portal:URL,mac:MAC_ADDRESS`).
+    - **Export to File:** Exports a list of Xtream Codes M3U links and/or Stalker Portal credential strings for selected entries. This file can be used for backup or re-import.
+
 
 ## Download & Installation
 
@@ -30,8 +35,14 @@ No installation is required. Simply download the `IPTV Manager v0.2.4.exe` file 
     *   When clicking `Add Entry`, you can now choose the "Account Type":
         *   **Xtream Codes API:** Enter Server URL, Username, and Password.
         *   **Stalker Portal:** Enter Portal URL (e.g., `http://portal.example.com:8080/c/`) and the MAC Address for the device (format: `XX:XX:XX:XX:XX:XX`).
-    *   `Import URL` and `Import File` are primarily for Xtream Codes API `get.php` links.
+    *   `Import URL` is for single Xtream Codes API `get.php` links.
+    *   `Import File` can be used to batch import:
+        *   Xtream Codes API links (one `get.php` URL per line).
+        *   Stalker Portal credentials (one entry per line, format: `stalker_portal:YOUR_PORTAL_URL,mac:YOUR_MAC_ADDRESS`).
 4.  Select accounts and use the `Check Selected` or `Check All Visible` buttons to refresh their status from the provider's API (*note*: `Check All Visible` will take a while if you have many playlists).
+5.  Use "Copy Link (Current)" or "Export Links (Selected)" to get account data:
+    *   For Xtream Codes API entries, this will be the M3U playable link.
+    *   For Stalker Portal entries, this will be a credential string in the format `stalker_portal:URL,mac:MAC_ADDRESS` (useful for backup or re-importing into this tool or others that might support this format).
 
 ## License
 

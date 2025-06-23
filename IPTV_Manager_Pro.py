@@ -1454,17 +1454,61 @@ class MainWindow(QMainWindow):
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 for line_num, line in enumerate(f, 1):
-                    url_string = line.strip()
-                    if not url_string or url_string.startswith('#'): continue
-                    parsed_info = parse_get_php_url(url_string)
-                    if parsed_info and not parsed_info.get('error'):
+                    line_content = line.strip()
+                    if not line_content or line_content.startswith('#'):
+                        continue
+
+                    if line_content.startswith("stalker_portal:"):
                         try:
-                            host = urlparse(parsed_info['server_base_url']).hostname or "host"; display_name = f"{host}_{parsed_info['username']}_L{line_num}"
-                            add_entry(display_name, default_category, parsed_info['server_base_url'], parsed_info['username'], parsed_info['password'])
+                            # Format: stalker_portal:{PORTAL_URL},mac:{MAC_ADDRESS}
+                            parts = line_content.split(',')
+                            portal_part_full = parts[0].strip() # stalker_portal:http://...
+                            mac_part_full = parts[1].strip()    # mac:00:1A:...
+
+                            if not portal_part_full.startswith("stalker_portal:") or not mac_part_full.startswith("mac:"):
+                                raise ValueError("Malformed stalker string")
+
+                            portal_url = portal_part_full.replace("stalker_portal:", "").strip()
+                            mac_address = mac_part_full.replace("mac:", "").strip().upper()
+
+                            if not (portal_url.startswith("http://") or portal_url.startswith("https://")):
+                                logging.warning(f"Batch Import: Invalid Stalker portal URL on line {line_num}: {portal_url}"); failed_count += 1; continue
+
+                            mac_pattern = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+                            if not mac_pattern.match(mac_address):
+                                logging.warning(f"Batch Import: Invalid Stalker MAC address on line {line_num}: {mac_address}"); failed_count += 1; continue
+
+                            # Auto-generate display name
+                            parsed_p_url = urlparse(portal_url)
+                            host = parsed_p_url.hostname or "stalker_host"
+                            display_name = f"{host}_{mac_address.replace(':', '')}_L{line_num}"
+
+                            # For Stalker, server_base_url is derived, username/password are blank
+                            server_base_url = f"{parsed_p_url.scheme}://{parsed_p_url.netloc}" if parsed_p_url.scheme and parsed_p_url.netloc else portal_url
+
+                            add_entry(display_name, default_category, server_base_url, "", "",
+                                      account_type='stalker', mac_address=mac_address, portal_url=portal_url)
                             imported_count += 1
-                        except Exception as db_e: logging.error(f"Batch Import: DB error for URL '{url_string}': {db_e}"); failed_count += 1
-                    else: logging.warning(f"Batch Import: Failed to parse URL on line {line_num}: {url_string} - {parsed_info.get('error', 'Unknown') if parsed_info else 'None'}"); failed_count += 1
-            QMessageBox.information(self, "Batch Import Complete", f"Imported: {imported_count}\nFailed: {failed_count}\nSee log for details.")
+                            logging.info(f"Batch Import: Successfully imported Stalker entry from line {line_num}")
+                        except Exception as e_stalker:
+                            logging.error(f"Batch Import: Error processing Stalker line {line_num} ('{line_content}'): {e_stalker}"); failed_count += 1
+
+                    elif "get.php?" in line_content: # Existing XC API logic
+                        parsed_info = parse_get_php_url(line_content)
+                        if parsed_info and not parsed_info.get('error'):
+                            try:
+                                host = urlparse(parsed_info['server_base_url']).hostname or "host"
+                                display_name = f"{host}_{parsed_info['username']}_L{line_num}"
+                                add_entry(display_name, default_category, parsed_info['server_base_url'], parsed_info['username'], parsed_info['password']) # Defaults to account_type='xc'
+                                imported_count += 1
+                            except Exception as db_e: logging.error(f"Batch Import: DB error for XC URL on line {line_num} ('{line_content}'): {db_e}"); failed_count += 1
+                        else:
+                            logging.warning(f"Batch Import: Failed to parse XC URL on line {line_num}: {line_content} - {parsed_info.get('error', 'Unknown') if parsed_info else 'None'}"); failed_count += 1
+                    else:
+                        logging.warning(f"Batch Import: Skipped unrecognized line {line_num}: {line_content[:100]}...") # Log first 100 chars
+                        failed_count +=1 # Consider if this should be counted as failure or just skipped
+
+            QMessageBox.information(self, "Batch Import Complete", f"Imported: {imported_count}\nFailed/Skipped: {failed_count}\nSee log for details.")
             if imported_count > 0: self.load_entries_to_table(); self.update_category_filter_combo()
         except IOError as e: logging.error(f"Error reading import file '{file_path}': {e}"); QMessageBox.critical(self, "File Error", f"Could not read file: {e}")
         except Exception as e_gen: logging.error(f"Unexpected error during batch import: {e_gen}"); QMessageBox.critical(self, "Import Error", f"Unexpected error: {e_gen}")
@@ -1480,10 +1524,9 @@ class MainWindow(QMainWindow):
         if entry:
             account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
             if account_type == 'stalker':
-                # For Stalker, a direct M3U link isn't applicable in the same way.
-                # Returning the portal URL might be the most "link-like" useful info.
-                # Or return None and let the caller handle it.
-                return None # Signifies not applicable
+                portal_url = entry['portal_url'] or ""
+                mac_address = entry['mac_address'] or ""
+                return f"stalker_portal:{portal_url},mac:{mac_address}"
             else: # XC
                 return f"{entry['server_base_url']}/get.php?username={entry['username']}&password={entry['password']}&type=m3u_plus&output=ts"
         return None
@@ -1491,21 +1534,26 @@ class MainWindow(QMainWindow):
     @Slot()
     def export_current_to_clipboard(self):
         current_proxy_index = self.table_view.currentIndex()
-        m3u_link = self.get_entry_data_for_export(current_proxy_index)
-        if m3u_link:
-            QGuiApplication.clipboard().setText(m3u_link)
-            self.status_bar.showMessage("M3U link copied to clipboard (XC API only).", 3000)
-        else:
-            # Check if it's a Stalker entry or genuinely failed to get data for XC
+        export_string = self.get_entry_data_for_export(current_proxy_index)
+        if export_string:
+            QGuiApplication.clipboard().setText(export_string)
+
+            # Determine message based on what was copied
             source_index = self.proxy_model.mapToSource(current_proxy_index)
             entry_id_item = self.table_model.itemFromIndex(source_index.siblingAtColumn(COL_ID))
+            message = "Data copied to clipboard."
             if entry_id_item:
                 entry_id = entry_id_item.data(Qt.UserRole)
                 db_entry = get_entry_by_id(entry_id)
-                if db_entry and (db_entry['account_type'] if db_entry['account_type'] is not None else 'xc') == 'stalker':
-                    QMessageBox.information(self, "Copy Link", "Direct M3U link generation is not applicable for Stalker Portal entries.")
-                    return
-            QMessageBox.warning(self, "Export Error", "Could not get M3U link for the current entry.")
+                if db_entry:
+                    account_type = db_entry['account_type'] if db_entry['account_type'] is not None else 'xc'
+                    if account_type == 'stalker':
+                        message = "Stalker credentials copied to clipboard."
+                    else:
+                        message = "XC API M3U link copied to clipboard."
+            self.status_bar.showMessage(message, 3000)
+        else:
+            QMessageBox.warning(self, "Export Error", "Could not get data for the current entry to copy.")
 
     @Slot()
     def export_selected_to_txt(self):

@@ -7,6 +7,8 @@ import sqlite3
 import json
 import logging
 import time
+import re # Added for MAC address validation
+from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone, timedelta
@@ -61,6 +63,7 @@ LOG_FILE = 'iptv_manager_log.txt'
 USER_AGENT = f'{APP_NAME}/{APP_VERSION} (okhttp/3.12.1)'
 API_TIMEOUT = 15
 REQUEST_DELAY_BETWEEN_CHECKS = 0.2
+SETTINGS_FILE = "settings.json"
 
 REPORT_DISPLAY_TIMEZONE = "America/Los_Angeles" # Example
 try:
@@ -116,9 +119,29 @@ def initialize_database():
                 max_connections INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 raw_user_info TEXT,
-                raw_server_info TEXT
+                raw_server_info TEXT,
+                account_type TEXT DEFAULT 'xc',
+                mac_address TEXT,
+                portal_url TEXT
             )
         ''')
+        # Add new columns if they don't exist (for existing databases)
+        try:
+            cursor.execute("SELECT account_type FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'account_type' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN account_type TEXT DEFAULT 'xc'")
+        try:
+            cursor.execute("SELECT mac_address FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'mac_address' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN mac_address TEXT")
+        try:
+            cursor.execute("SELECT portal_url FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'portal_url' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN portal_url TEXT")
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,29 +159,30 @@ def initialize_database():
     finally:
         if conn: conn.close()
 
-def add_entry(name, category, server_url, username, password):
+def add_entry(name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None):
     conn = get_db_connection()
     try:
         cursor = conn.execute('''
-            INSERT INTO entries (name, category, server_base_url, username, password)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (name, category, server_url, username, password))
+            INSERT INTO entries (name, category, server_base_url, username, password, account_type, mac_address, portal_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url))
         conn.commit()
         entry_id = cursor.lastrowid
-        logging.info(f"Added entry: {name} (ID: {entry_id})")
+        logging.info(f"Added entry: {name} (ID: {entry_id}, Type: {account_type})")
         return entry_id
     finally: conn.close()
 
-def update_entry(entry_id, name, category, server_url, username, password):
+def update_entry(entry_id, name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None):
     conn = get_db_connection()
     try:
         conn.execute('''
             UPDATE entries
-            SET name = ?, category = ?, server_base_url = ?, username = ?, password = ?
+            SET name = ?, category = ?, server_base_url = ?, username = ?, password = ?,
+                account_type = ?, mac_address = ?, portal_url = ?
             WHERE id = ?
-        ''', (name, category, server_url, username, password, entry_id))
+        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, entry_id))
         conn.commit()
-        logging.info(f"Updated entry ID: {entry_id}")
+        logging.info(f"Updated entry ID: {entry_id} (Type: {account_type})")
     finally: conn.close()
 
 def delete_entry(entry_id):
@@ -353,7 +377,7 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
         api_status_val = get_safe_api_value(user_info, 'status')
         if api_status_val is not None:
              processed_data['api_status'] = api_status_val
-        
+
         user_info_message = get_safe_api_value(user_info, 'message', '')
         if user_info_message:
              processed_data['api_message'] = f"{current_api_msg} {user_info_message}".strip() if current_api_msg else user_info_message
@@ -394,7 +418,7 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
             except (ValueError, TypeError):
                 logging.warning(f"API Check {username}: Invalid max_connections format '{max_c_raw}'")
                 pass
-        
+
         if processed_data['success'] and processed_data['api_status'] in [None, 'Unknown'] and not processed_data['api_message']:
             processed_data['api_message'] = "Valid connection but key data missing from API."
 
@@ -415,9 +439,214 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
     except Exception as e:
         processed_data['api_message'] = f"Unexpected API Error: {type(e).__name__}"
         logging.exception(f"Unexpected error during API check for {username}.")
-    
+
     processed_data['success'] = False
     return processed_data
+
+# --- Stalker Portal API Functions ---
+STALKER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+STALKER_COMMON_HEADERS = {
+    'User-Agent': STALKER_USER_AGENT,
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'X-Requested-With': 'XMLHttpRequest',
+}
+
+def _get_stalker_token(session: requests.Session, portal_url: str, mac_address: str) -> Optional[str]:
+    """Performs handshake and retrieves token for Stalker Portal."""
+    handshake_url = f"{portal_url.rstrip('/')}/portal.php?action=handshake&type=stb&token=&JsHttpRequest=1-xml"
+    headers = {**STALKER_COMMON_HEADERS, 'Authorization': f"MAC {mac_address}"}
+    # Stalker portals often expect the MAC as a cookie as well.
+    # maclist.py seems to use the MAC with colons directly.
+    session.cookies.update({"mac": mac_address})
+    session.headers.update({'Referer': f"{portal_url.rstrip('/')}/c/"})
+
+    logging.info(f"Stalker: Attempting handshake with {portal_url} for MAC {mac_address} (Cookie MAC: {mac_address})")
+    try:
+        response = session.get(handshake_url, headers=headers, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        token = data.get("js", {}).get("token")
+        if token:
+            logging.info(f"Stalker: Handshake successful, token received for MAC {mac_address}")
+            return token
+        else:
+            logging.warning(f"Stalker: Handshake response did not contain token for MAC {mac_address}. Response: {response.text[:200]}")
+            return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Stalker: Handshake request exception for MAC {mac_address} to {portal_url}: {e}")
+    except json.JSONDecodeError as e:
+        logging.error(f"Stalker: Handshake JSON decode error for MAC {mac_address} to {portal_url}: {e}. Response: {response.text[:200] if 'response' in locals() else 'N/A'}")
+    except KeyError as e:
+        logging.error(f"Stalker: Handshake Key error (likely missing 'js' or 'token') for MAC {mac_address}: {e}. Response: {response.text[:200] if 'response' in locals() else 'N/A'}")
+    return None
+
+def check_stalker_portal_status(portal_url: str, mac_address: str, session: requests.Session):
+    processed_data = {
+        'success': False, 'api_status': "Error", 'api_message': "Check init error (Stalker)",
+        'expiry_date_ts': None, 'is_trial': None, 'active_connections': None, # Stalker might not provide these
+        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None # server_info not typical for Stalker
+    }
+
+    if not all([portal_url, mac_address, session]):
+        processed_data['api_message'] = "Internal Error: Missing parameters for Stalker API call"
+        return processed_data
+
+    # Ensure MAC address is in the common format for headers/cookies if needed
+    formatted_mac = mac_address.upper() # For Authorization header
+    # cookie_mac = mac_address.replace(":", "").lower() # Example for cookie, if portal expects it specifically
+
+    token = _get_stalker_token(session, portal_url, formatted_mac)
+
+    if not token:
+        processed_data['api_message'] = "Stalker Handshake Failed: Could not get token."
+        # Log already done in _get_stalker_token
+        return processed_data
+
+    account_info_url = f"{portal_url.rstrip('/')}/portal.php?type=account_info&action=get_main_info&JsHttpRequest=1-xml"
+    headers = {**STALKER_COMMON_HEADERS, 'Authorization': f"Bearer {token}"}
+    # Referer is typically set on the session already by _get_stalker_token
+
+    logging.info(f"Stalker: Getting account info from {portal_url} for MAC {formatted_mac}")
+    response_text = None
+    try:
+        response = session.get(account_info_url, headers=headers, timeout=API_TIMEOUT)
+        response_text = response.text
+        response.raise_for_status()
+        data = response.json()
+        user_info = data.get("js", {})
+
+        processed_data['raw_user_info'] = json.dumps(user_info)
+
+        if not isinstance(user_info, dict):
+            processed_data['api_message'] = "Invalid 'user_info' format (Stalker)"
+            processed_data['success'] = False
+            return processed_data
+
+        # Stalker portals use various fields for status and expiry.
+        # Common ones include 'status', 'exp_date' (unix timestamp or string), or sometimes in 'data' sub-object.
+        # The `maclist.py` example used `phone` for expiry, which is unusual. Let's be flexible.
+
+        # Infer status:
+        # A common pattern is status=1 means active, status=0 or 2 might mean inactive/expired.
+        # If 'status' field exists and is 0 or 2, it's likely not active.
+        # If 'exp_date' is in the past, it's expired.
+
+        api_status_val = user_info.get('status')
+        if api_status_val is not None:
+            api_status_str = str(api_status_val).lower()
+            if api_status_str == '1':
+                processed_data['api_status'] = "Active"
+            elif api_status_str == '0' or api_status_str == '2':
+                 processed_data['api_status'] = "Inactive/Disabled" # More specific than just "Expired"
+            else:
+                processed_data['api_status'] = f"Status: {api_status_val}"
+        else:
+            # If no explicit status, we'll rely on expiry date or assume active if expiry is future/valid.
+            processed_data['api_status'] = "Info Retrieved" # Placeholder, will be updated by expiry logic
+
+        # Expiry Date Handling:
+        # Stalker portals can have 'exp_date' as a unix timestamp or a string 'YYYY-MM-DD HH:MM:SS' or 'DD.MM.YYYY'.
+        # The example `maclist.py` used 'phone' for expiry.
+        exp_date_raw = user_info.get('exp_date') # Primary target
+        if exp_date_raw is None:
+            exp_date_raw = user_info.get('expire_date') # Secondary common target
+
+        source_of_date = "exp_date/expire_date"
+
+        if exp_date_raw is None and 'phone' in user_info: # Check 'phone' only if others failed
+            exp_date_raw = user_info.get('phone')
+            source_of_date = "phone"
+            logging.info(f"Stalker: Trying to parse expiry from 'phone' field for MAC {formatted_mac}: '{exp_date_raw}'")
+
+
+        if exp_date_raw is not None:
+            try:
+                # Attempt to parse as Unix timestamp first
+                exp_ts = int(float(exp_date_raw))
+                if exp_ts > 0:
+                    processed_data['expiry_date_ts'] = exp_ts
+                    logging.info(f"Stalker: Parsed expiry for MAC {formatted_mac} as UNIX timestamp: {exp_ts} from '{source_of_date}' field.")
+            except (ValueError, TypeError):
+                # Attempt to parse as string date
+                if isinstance(exp_date_raw, str):
+                    dt_obj = None
+                    parsed_format_msg = ""
+                    try:
+                        # Try "Month Day, Year, HH:MM am/pm" format (e.g., "August 17, 2025, 12:00 am")
+                        dt_obj = datetime.strptime(exp_date_raw, '%B %d, %Y, %I:%M %p')
+                        parsed_format_msg = "%B %d, %Y, %I:%M %p"
+                    except ValueError:
+                        try:
+                            # Try "YYYY-MM-DD HH:MM:SS"
+                            dt_obj = datetime.strptime(exp_date_raw, '%Y-%m-%d %H:%M:%S')
+                            parsed_format_msg = "%Y-%m-%d %H:%M:%S"
+                        except ValueError:
+                            try:
+                                # Try "DD.MM.YYYY"
+                                dt_obj = datetime.strptime(exp_date_raw, '%d.%m.%Y')
+                                parsed_format_msg = "%d.%m.%Y"
+                            except ValueError:
+                                # Add more formats if needed
+                                pass # dt_obj remains None
+
+                    if dt_obj:
+                        # Assume parsed naive datetime is in UTC as server times often are.
+                        # If it were local, timezone conversion would be needed if TZ known.
+                        processed_data['expiry_date_ts'] = int(dt_obj.replace(tzinfo=timezone.utc).timestamp())
+                        logging.info(f"Stalker: Parsed expiry for MAC {formatted_mac} from string '{exp_date_raw}' (format '{parsed_format_msg}') to TS: {processed_data['expiry_date_ts']} from '{source_of_date}' field.")
+                        if source_of_date == "phone" and (not processed_data['api_message'] or processed_data['api_message'] == "Check init error (Stalker)"):
+                             processed_data['api_message'] = f"Expiry from 'phone': {exp_date_raw}"
+
+                    else:
+                        logging.warning(f"Stalker: Unparseable string exp_date '{exp_date_raw}' for MAC {formatted_mac} from '{source_of_date}'.")
+                        if not processed_data['api_message'] or processed_data['api_message'] == "Check init error (Stalker)" or "format unknown" not in processed_data['api_message'] :
+                             processed_data['api_message'] = f"Expiry date format unknown: {str(exp_date_raw)[:30]}"
+                else:
+                    logging.warning(f"Stalker: Invalid (non-string, non-numeric) exp_date format '{exp_date_raw}' for MAC {formatted_mac} from '{source_of_date}'.")
+
+        # Update status based on expiry
+        if processed_data['expiry_date_ts'] is not None:
+            if processed_data['expiry_date_ts'] < datetime.now(timezone.utc).timestamp():
+                processed_data['api_status'] = "Expired"
+            elif processed_data['api_status'] == "Info Retrieved": # Only if not explicitly inactive
+                 processed_data['api_status'] = "Active"
+        elif processed_data['api_status'] == "Info Retrieved": # No expiry, no explicit status
+            processed_data['api_status'] = "Unknown" # Or "Active (No Expiry)"
+
+        # Stalker portals usually don't provide trial, active_cons, max_cons in get_main_info
+        # These will remain None unless specific portals are found to provide them.
+        # is_trial, active_connections, max_connections remain as their defaults (None)
+
+        processed_data['success'] = True
+        if not processed_data.get('api_message') or processed_data['api_message'] == "Check init error (Stalker)":
+            processed_data['api_message'] = user_info.get('message', "Status successfully retrieved.") # Some portals might have a message field
+        if not processed_data['api_message'] and processed_data['success']:
+             processed_data['api_message'] = "OK"
+
+
+        return processed_data
+
+    except requests.exceptions.Timeout:
+        processed_data['api_message'] = f"Request Timeout ({API_TIMEOUT}s) (Stalker)"
+        logging.warning(f"Stalker: Timeout for MAC {formatted_mac} at {portal_url}")
+    except requests.exceptions.HTTPError as e:
+        processed_data['api_message'] = f"HTTP Error {e.response.status_code} (Stalker)"
+        if response_text: processed_data['raw_user_info'] = json.dumps({"error_context_response": response_text[:500]})
+        logging.warning(f"Stalker: HTTP Error {e.response.status_code} for MAC {formatted_mac} at {portal_url}. Response: {response_text[:200] if response_text else 'N/A'}")
+    except requests.exceptions.RequestException as e:
+        processed_data['api_message'] = f"Connection Error (Stalker): {type(e).__name__}"
+        logging.warning(f"Stalker: Connection Error for MAC {formatted_mac} at {portal_url}: {e}")
+    except json.JSONDecodeError:
+        processed_data['api_message'] = "Invalid JSON response (Stalker)"
+        if response_text: processed_data['raw_user_info'] = json.dumps({"non_json_response": response_text[:500]})
+        logging.warning(f"Stalker: JSON Decode Error for MAC {formatted_mac} at {portal_url}. Response: {response_text[:200] if response_text else 'N/A'}")
+    except Exception as e:
+        processed_data['api_message'] = f"Unexpected API Error (Stalker): {type(e).__name__}"
+        logging.exception(f"Stalker: Unexpected error during API check for MAC {formatted_mac} at {portal_url}.")
+
+    processed_data['success'] = False
+    return processed_data
+
 
 # =============================================================================
 # DIALOGS
@@ -427,39 +656,174 @@ class EntryDialog(QDialog):
         super().__init__(parent); self.entry_id = entry_id; self.is_edit_mode = entry_id is not None
         self.setWindowTitle(f"{'Edit' if self.is_edit_mode else 'Add'} IPTV Entry"); self.setMinimumWidth(450); self.setWindowModality(Qt.WindowModal)
         layout = QVBoxLayout(self); form_layout = QFormLayout()
-        self.name_edit = QLineEdit(); self.category_combo = QComboBox(); self.server_url_edit = QLineEdit(); self.username_edit = QLineEdit()
-        self.password_edit = QLineEdit(); self.password_edit.setEchoMode(QLineEdit.Password); self.populate_categories()
-        form_layout.addRow("Display Name:", self.name_edit); form_layout.addRow("Category:", self.category_combo)
-        form_layout.addRow("Server URL (e.g., http://domain:port):", self.server_url_edit); form_layout.addRow("Username:", self.username_edit)
-        form_layout.addRow("Password:", self.password_edit); layout.addLayout(form_layout)
+
+        self.name_edit = QLineEdit()
+        self.category_combo = QComboBox()
+        self.populate_categories()
+
+        self.account_type_combo = QComboBox()
+        self.account_type_combo.addItems(["Xtream Codes API", "Stalker Portal"])
+        self.account_type_combo.currentTextChanged.connect(self.toggle_input_fields)
+
+        # XC API Fields
+        self.server_url_label = QLabel("Server URL (e.g., http://domain:port):")
+        self.server_url_edit = QLineEdit()
+        self.username_label = QLabel("Username:")
+        self.username_edit = QLineEdit()
+        self.password_label = QLabel("Password:")
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+
+        # Stalker Portal Fields
+        self.portal_url_label = QLabel("Portal URL (e.g., http://domain:port/c/):")
+        self.portal_url_edit = QLineEdit()
+        self.mac_address_label = QLabel("MAC Address (XX:XX:XX:XX:XX:XX):")
+        self.mac_address_edit = QLineEdit()
+
+        form_layout.addRow("Display Name:", self.name_edit)
+        form_layout.addRow("Category:", self.category_combo)
+        form_layout.addRow("Account Type:", self.account_type_combo)
+
+        # Add XC fields (will be shown/hidden)
+        form_layout.addRow(self.server_url_label, self.server_url_edit)
+        form_layout.addRow(self.username_label, self.username_edit)
+        form_layout.addRow(self.password_label, self.password_edit)
+
+        # Add Stalker fields (will be shown/hidden)
+        form_layout.addRow(self.portal_url_label, self.portal_url_edit)
+        form_layout.addRow(self.mac_address_label, self.mac_address_edit)
+
+        layout.addLayout(form_layout)
         self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.button_box.accepted.connect(self.accept_dialog); self.button_box.rejected.connect(self.reject); layout.addWidget(self.button_box)
-        if self.is_edit_mode: self.load_entry_data()
+        self.button_box.accepted.connect(self.accept_dialog)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+        if self.is_edit_mode:
+            self.load_entry_data()
+        else:
+            self.toggle_input_fields(self.account_type_combo.currentText()) # Initial field visibility
+
         self.name_edit.setFocus()
+
+    def toggle_input_fields(self, account_type_text):
+        is_stalker = account_type_text == "Stalker Portal"
+
+        # XC Fields
+        self.server_url_label.setVisible(not is_stalker)
+        self.server_url_edit.setVisible(not is_stalker)
+        self.username_label.setVisible(not is_stalker)
+        self.username_edit.setVisible(not is_stalker)
+        self.password_label.setVisible(not is_stalker)
+        self.password_edit.setVisible(not is_stalker)
+
+        # Stalker Fields
+        self.portal_url_label.setVisible(is_stalker)
+        self.portal_url_edit.setVisible(is_stalker)
+        self.mac_address_label.setVisible(is_stalker)
+        self.mac_address_edit.setVisible(is_stalker)
+
     def populate_categories(self):
         self.category_combo.clear();
         try: cats = get_all_categories(); self.category_combo.addItems(cats if cats else ["Uncategorized"])
         except Exception as e: logging.error(f"Failed to populate categories: {e}"); self.category_combo.addItem("Uncategorized")
+
     def load_entry_data(self):
         try:
             entry = get_entry_by_id(self.entry_id)
             if entry:
-                self.name_edit.setText(entry['name']); self.server_url_edit.setText(entry['server_base_url'])
-                self.username_edit.setText(entry['username']); self.password_edit.setText(entry['password'])
+                self.name_edit.setText(entry['name'])
+                # entry is an sqlite3.Row object.
+                current_account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
+                type_display_name = "Stalker Portal" if current_account_type == 'stalker' else "Xtream Codes API"
+                self.account_type_combo.setCurrentText(type_display_name)
+                self.toggle_input_fields(type_display_name) # Ensure fields are visible before setting text
+
+                if current_account_type == 'stalker':
+                    self.portal_url_edit.setText(entry['portal_url'] or "")
+                    self.mac_address_edit.setText(entry['mac_address'] or "")
+                    # Clear XC fields if they had data from a previous type
+                    self.server_url_edit.setText("")
+                    self.username_edit.setText("")
+                    self.password_edit.setText("")
+                else: # 'xc' or default
+                    self.server_url_edit.setText(entry['server_base_url'])
+                    self.username_edit.setText(entry['username'])
+                    self.password_edit.setText(entry['password'])
+                    # Clear Stalker fields
+                    self.portal_url_edit.setText("")
+                    self.mac_address_edit.setText("")
+
                 idx = self.category_combo.findText(entry['category'])
                 if idx != -1: self.category_combo.setCurrentIndex(idx)
                 else: self.category_combo.addItem(entry['category']); self.category_combo.setCurrentText(entry['category'])
             else: QMessageBox.warning(self, "Error", "Could not load entry data."); self.reject()
         except Exception as e: logging.error(f"Error loading entry ID {self.entry_id}: {e}"); QMessageBox.critical(self, "Load Error", f"Failed to load: {e}"); self.reject()
-    def get_data(self): return {"name": self.name_edit.text().strip(), "category": self.category_combo.currentText(), "server_url": self.server_url_edit.text().strip(), "username": self.username_edit.text().strip(), "password": self.password_edit.text()}
+
+    def get_data(self):
+        data = {
+            "name": self.name_edit.text().strip(),
+            "category": self.category_combo.currentText(),
+            "account_type_text": self.account_type_combo.currentText()
+        }
+        if data["account_type_text"] == "Stalker Portal":
+            data["account_type"] = "stalker"
+            data["portal_url"] = self.portal_url_edit.text().strip()
+            data["mac_address"] = self.mac_address_edit.text().strip().upper()
+            # For Stalker, server_base_url might be derived from portal_url or set to portal_url itself
+            # Let's use portal_url for server_base_url for now, can be refined.
+            # Username/password are not used for Stalker in this context
+            parsed_portal = urlparse(data["portal_url"])
+            data["server_url"] = f"{parsed_portal.scheme}://{parsed_portal.netloc}" if parsed_portal.scheme and parsed_portal.netloc else data["portal_url"]
+            data["username"] = "" # Not applicable
+            data["password"] = "" # Not applicable
+        else: # Xtream Codes API
+            data["account_type"] = "xc"
+            data["server_url"] = self.server_url_edit.text().strip()
+            data["username"] = self.username_edit.text().strip()
+            data["password"] = self.password_edit.text()
+            data["portal_url"] = None
+            data["mac_address"] = None
+        return data
+
     @Slot()
     def accept_dialog(self):
         data = self.get_data()
-        if not all([data['name'], data['server_url'], data['username'] is not None]): QMessageBox.warning(self, "Input Error", "Name, Server URL, and Username must be filled."); return
-        if not (data['server_url'].startswith("http://") or data['server_url'].startswith("https://")): QMessageBox.warning(self, "Input Error", "Server URL must start with http:// or https://."); return
+
+        # Common validation
+        if not data['name']:
+            QMessageBox.warning(self, "Input Error", "Display Name must be filled.")
+            return
+
+        if data['account_type'] == 'xc':
+            if not all([data['server_url'], data['username'] is not None]): # Password can be empty
+                QMessageBox.warning(self, "Input Error", "For Xtream Codes API, Name, Server URL, and Username must be filled.")
+                return
+            if not (data['server_url'].startswith("http://") or data['server_url'].startswith("https://")):
+                QMessageBox.warning(self, "Input Error", "Server URL must start with http:// or https://.")
+                return
+        elif data['account_type'] == 'stalker':
+            if not all([data['portal_url'], data['mac_address']]):
+                QMessageBox.warning(self, "Input Error", "For Stalker Portal, Portal URL and MAC Address must be filled.")
+                return
+            if not (data['portal_url'].startswith("http://") or data['portal_url'].startswith("https://")):
+                QMessageBox.warning(self, "Input Error", "Portal URL must start with http:// or https://.")
+                return
+
+            mac_pattern = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+            if not mac_pattern.match(data['mac_address']):
+                 QMessageBox.warning(self, "Input Error", "MAC Address must be in the format XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX.")
+                 return
+
         try:
-            if self.is_edit_mode: update_entry(self.entry_id, data['name'], data['category'], data['server_url'], data['username'], data['password'])
-            else: add_entry(data['name'], data['category'], data['server_url'], data['username'], data['password'])
+            if self.is_edit_mode:
+                update_entry(self.entry_id, data['name'], data['category'],
+                             data['server_url'], data['username'], data['password'],
+                             data['account_type'], data['mac_address'], data['portal_url'])
+            else:
+                add_entry(data['name'], data['category'],
+                          data['server_url'], data['username'], data['password'],
+                          data['account_type'], data['mac_address'], data['portal_url'])
             self.accept()
         except Exception as e: logging.error(f"Error saving entry: {e}"); QMessageBox.critical(self, "Database Error", f"Could not save: {e}")
 
@@ -659,13 +1023,28 @@ class ApiCheckerWorker(QObject):
                     self.progress_updated.emit(processed_count, total)
                     continue
 
-                # Actual API call
-                api_result = check_account_status_detailed_api(
-                    entry_data['server_base_url'],
-                    entry_data['username'],
-                    entry_data['password'],
-                    self._session
-                )
+                # entry_data is an sqlite3.Row object.
+                account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
+                api_result = None
+
+                if account_type == 'stalker':
+                    logging.info(f"Worker: Checking Stalker Portal entry ID {entry_id} (MAC: {entry_data['mac_address']})")
+                    api_result = check_stalker_portal_status(
+                        entry_data['portal_url'], # Use the specific portal_url field
+                        entry_data['mac_address'],
+                        self._session
+                    )
+                else: # 'xc' or other unknown types default to XC API check
+                    if account_type != 'xc':
+                        logging.warning(f"Worker: Unknown account type '{account_type}' for entry ID {entry_id}. Defaulting to XC API check.")
+                    logging.info(f"Worker: Checking XC API entry ID {entry_id} (User: {entry_data['username']})")
+                    api_result = check_account_status_detailed_api(
+                        entry_data['server_base_url'],
+                        entry_data['username'],
+                        entry_data['password'],
+                        self._session
+                    )
+
                 self.result_ready.emit(entry_id, api_result)
                 processed_count += 1
                 if REQUEST_DELAY_BETWEEN_CHECKS > 0:
@@ -740,7 +1119,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
-COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "Username", "Message"]
+COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "User / MAC", "Message"]
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -755,79 +1134,143 @@ class MainWindow(QMainWindow):
         self.load_entries_to_table()
         self.update_category_filter_combo()
         self.update_action_button_states()
+        self.load_settings() # Load settings on startup
         # *** MODIFIED LINE ***
         # Use the resource_path helper to find the icon, both in development and in the PyInstaller bundle.
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
 
     def setup_ui(self):
-        menubar = self.menuBar(); file_menu = menubar.addMenu("&File")
-        import_url_action = QAction("Import from &URL...", self); import_url_action.triggered.connect(self.import_from_url_action); file_menu.addAction(import_url_action)
-        import_file_action = QAction("Import from &File...", self); import_file_action.triggered.connect(self.import_from_file_action); file_menu.addAction(import_file_action)
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("&File")
+        import_url_action = QAction("Import from &URL...", self)
+        import_url_action.triggered.connect(self.import_from_url_action)
+        file_menu.addAction(import_url_action)
+        import_file_action = QAction("Import from &File...", self)
+        import_file_action.triggered.connect(self.import_from_file_action)
+        file_menu.addAction(import_file_action)
         file_menu.addSeparator()
-        export_clipboard_action = QAction("Copy Link for Current Entry", self); export_clipboard_action.triggered.connect(self.export_current_to_clipboard); file_menu.addAction(export_clipboard_action)
-        export_txt_action = QAction("Export Links for Selected Entries...", self); export_txt_action.triggered.connect(self.export_selected_to_txt); file_menu.addAction(export_txt_action)
+        export_clipboard_action = QAction("Copy Link for Current Entry", self)
+        export_clipboard_action.triggered.connect(self.export_current_to_clipboard)
+        file_menu.addAction(export_clipboard_action)
+        export_txt_action = QAction("Export Links for Selected Entries...", self)
+        export_txt_action.triggered.connect(self.export_selected_to_txt)
+        file_menu.addAction(export_txt_action)
         file_menu.addSeparator()
-        exit_action = QAction("&Exit", self); exit_action.setShortcut(QKeySequence.Quit); exit_action.triggered.connect(self.close); file_menu.addAction(exit_action)
 
-        main_widget = QWidget(); main_layout = QVBoxLayout(main_widget)
+        # Theme selection
+        theme_menu = file_menu.addMenu("&Theme")
+        self.light_theme_action = QAction("Light Mode", self, checkable=True)
+        self.light_theme_action.triggered.connect(lambda: self.set_theme("light"))
+        theme_menu.addAction(self.light_theme_action)
+        self.dark_theme_action = QAction("Dark Mode", self, checkable=True)
+        self.dark_theme_action.triggered.connect(lambda: self.set_theme("dark"))
+        theme_menu.addAction(self.dark_theme_action)
+        file_menu.addSeparator()
+
+        exit_action = QAction("&Exit", self)
+        exit_action.setShortcut(QKeySequence.Quit)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        main_widget = QWidget()
+        main_layout = QVBoxLayout(main_widget)
 
         top_controls_layout = QHBoxLayout()
-        self.add_button = QPushButton("Add Entry"); self.edit_button = QPushButton("Edit Selected")
+        self.add_button = QPushButton("Add Entry")
+        self.edit_button = QPushButton("Edit Selected")
         self.delete_button = QPushButton("Delete Selected")
-        self.import_url_button = QPushButton("Import URL"); self.import_file_button = QPushButton("Import File")
+        self.import_url_button = QPushButton("Import URL")
+        self.import_file_button = QPushButton("Import File")
 
-        top_controls_layout.addWidget(self.add_button); top_controls_layout.addWidget(self.edit_button); top_controls_layout.addWidget(self.delete_button)
-        top_controls_layout.addSpacing(10); top_controls_layout.addWidget(self.import_url_button); top_controls_layout.addWidget(self.import_file_button)
-        top_controls_layout.addStretch(); main_layout.addLayout(top_controls_layout)
+        top_controls_layout.addWidget(self.add_button)
+        top_controls_layout.addWidget(self.edit_button)
+        top_controls_layout.addWidget(self.delete_button)
+        top_controls_layout.addSpacing(10)
+        top_controls_layout.addWidget(self.import_url_button)
+        top_controls_layout.addWidget(self.import_file_button)
+        top_controls_layout.addStretch()
+        main_layout.addLayout(top_controls_layout)
 
         export_buttons_layout = QHBoxLayout()
-        self.export_clipboard_button = QPushButton("Copy Link (Current)"); export_buttons_layout.addWidget(self.export_clipboard_button)
-        self.export_txt_button = QPushButton("Export Links (Selected)"); export_buttons_layout.addWidget(self.export_txt_button)
+        self.export_clipboard_button = QPushButton("Copy Link (Current)")
+        export_buttons_layout.addWidget(self.export_clipboard_button)
+        self.export_txt_button = QPushButton("Export Links (Selected)")
+        export_buttons_layout.addWidget(self.export_txt_button)
         export_buttons_layout.addStretch()
         top_controls_layout.addSpacing(20)
         top_controls_layout.addWidget(self.export_clipboard_button)
         top_controls_layout.addWidget(self.export_txt_button)
 
         secondary_controls_layout = QHBoxLayout()
-        self.check_selected_button = QPushButton("Check Selected"); self.check_all_button = QPushButton("Check All Visible")
+        self.check_selected_button = QPushButton("Check Selected")
+        self.check_all_button = QPushButton("Check All Visible")
         self.manage_categories_button = QPushButton("Categories...")
-        secondary_controls_layout.addWidget(self.check_selected_button); secondary_controls_layout.addWidget(self.check_all_button)
-        secondary_controls_layout.addStretch(); secondary_controls_layout.addWidget(self.manage_categories_button); main_layout.addLayout(secondary_controls_layout)
+        secondary_controls_layout.addWidget(self.check_selected_button)
+        secondary_controls_layout.addWidget(self.check_all_button)
+        secondary_controls_layout.addStretch()
+        secondary_controls_layout.addWidget(self.manage_categories_button)
+        main_layout.addLayout(secondary_controls_layout)
 
         filter_controls_layout = QHBoxLayout()
         filter_controls_layout.addWidget(QLabel("Search:"))
-        self.search_edit = QLineEdit(); self.search_edit.setPlaceholderText("Type to search..."); filter_controls_layout.addWidget(self.search_edit)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Type to search...")
+        filter_controls_layout.addWidget(self.search_edit)
         filter_controls_layout.addSpacing(10)
         filter_controls_layout.addWidget(QLabel("Category:"))
-        self.category_filter_combo = QComboBox(); self.category_filter_combo.setMinimumWidth(150); filter_controls_layout.addWidget(self.category_filter_combo)
-        self.exclude_na_button = QPushButton("Exclude N/A"); self.exclude_na_button.setCheckable(True); filter_controls_layout.addWidget(self.exclude_na_button)
-        filter_controls_layout.addStretch(); main_layout.addLayout(filter_controls_layout)
+        self.category_filter_combo = QComboBox()
+        self.category_filter_combo.setMinimumWidth(150)
+        filter_controls_layout.addWidget(self.category_filter_combo)
+        self.exclude_na_button = QPushButton("Exclude N/A")
+        self.exclude_na_button.setCheckable(True)
+        filter_controls_layout.addWidget(self.exclude_na_button)
+        filter_controls_layout.addStretch()
+        main_layout.addLayout(filter_controls_layout)
 
-        self.table_view = QTableView(); self.table_model = QStandardItemModel(0, len(COLUMN_HEADERS))
-        self.table_model.setHorizontalHeaderLabels(COLUMN_HEADERS);
+        self.table_view = QTableView()
+        self.table_model = QStandardItemModel(0, len(COLUMN_HEADERS))
+        self.table_model.setHorizontalHeaderLabels(COLUMN_HEADERS)
         self.proxy_model = EntryFilterProxyModel(self)
-        self.proxy_model.setSourceModel(self.table_model); self.table_view.setModel(self.proxy_model)
+        self.proxy_model.setSourceModel(self.table_model)
+        self.table_view.setModel(self.proxy_model)
 
-        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows); self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table_view.setEditTriggers(QAbstractItemView.NoEditTriggers); self.table_view.setSortingEnabled(True)
-        self.table_view.sortByColumn(COL_NAME, Qt.AscendingOrder); header = self.table_view.horizontalHeader()
+        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_view.setSortingEnabled(True)
+        self.table_view.sortByColumn(COL_NAME, Qt.AscendingOrder)
+        header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(COL_ID, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_NAME, QHeaderView.Interactive); self.table_view.setColumnWidth(COL_NAME, 200)
-        header.setSectionResizeMode(COL_CATEGORY, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_EXPIRY, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_TRIAL, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_ACTIVE_CONN, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_MAX_CONN, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_NAME, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_NAME, 200)
+        header.setSectionResizeMode(COL_CATEGORY, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_EXPIRY, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_TRIAL, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_ACTIVE_CONN, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_MAX_CONN, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_LAST_CHECKED, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_SERVER, QHeaderView.Interactive); self.table_view.setColumnWidth(COL_SERVER, 150)
-        header.setSectionResizeMode(COL_USER, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_MSG, QHeaderView.Stretch)
-        main_layout.addWidget(self.table_view); self.setCentralWidget(main_widget)
-        self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
-        self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False); self.progress_bar.setTextVisible(True)
+        header.setSectionResizeMode(COL_SERVER, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_SERVER, 150)
+        header.setSectionResizeMode(COL_USER, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_MSG, QHeaderView.Stretch)
+        main_layout.addWidget(self.table_view)
+        self.setCentralWidget(main_widget)
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(True)
         self.status_bar.addPermanentWidget(self.progress_bar)
 
-        self.add_button.clicked.connect(self.add_entry_action); self.edit_button.clicked.connect(self.edit_entry_action)
-        self.delete_button.clicked.connect(self.delete_entry_action); self.import_url_button.clicked.connect(self.import_from_url_action)
-        self.import_file_button.clicked.connect(self.import_from_file_action); self.manage_categories_button.clicked.connect(self.manage_categories_action)
-        self.check_selected_button.clicked.connect(self.check_selected_entries_action); self.check_all_button.clicked.connect(self.check_all_entries_action)
+        self.add_button.clicked.connect(self.add_entry_action)
+        self.edit_button.clicked.connect(self.edit_entry_action)
+        self.delete_button.clicked.connect(self.delete_entry_action)
+        self.import_url_button.clicked.connect(self.import_from_url_action)
+        self.import_file_button.clicked.connect(self.import_from_file_action)
+        self.manage_categories_button.clicked.connect(self.manage_categories_action)
+        self.check_selected_button.clicked.connect(self.check_selected_entries_action)
+        self.check_all_button.clicked.connect(self.check_all_entries_action)
         self.export_clipboard_button.clicked.connect(self.export_current_to_clipboard)
         self.export_txt_button.clicked.connect(self.export_selected_to_txt)
 
@@ -883,19 +1326,46 @@ class MainWindow(QMainWindow):
                 if not dt_utc.isValid() : dt_utc = QDateTime.fromString(last_chk_raw, Qt.ISODateWithMs).toUTC()
                 dt_local = dt_utc.toLocalTime(); last_chk_disp = dt_local.toString("yyyy-MM-dd hh:mm")
             except Exception as e: logging.warning(f"Error parsing last_checked_at '{last_chk_raw}': {e}")
-        items.append(QStandardItem(last_chk_disp)); items.append(QStandardItem(entry_data['server_base_url']))
-        items.append(QStandardItem(entry_data['username']))
+        items.append(QStandardItem(last_chk_disp))
+
+        # entry_data is an sqlite3.Row object. Access columns using dictionary-style access.
+        # The 'account_type' column should exist due to migrations, defaulting to 'xc'.
+        account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
+
+        if account_type == 'stalker':
+            items.append(QStandardItem(entry_data['portal_url'] or 'N/A')) # Server column
+            items.append(QStandardItem(entry_data['mac_address'] or 'N/A')) # Username column, now User/MAC
+        else: # XC or if somehow account_type is None and defaulted to 'xc'
+            items.append(QStandardItem(entry_data['server_base_url'] or 'N/A'))
+            items.append(QStandardItem(entry_data['username'] or 'N/A'))
+
         api_msg = entry_data['api_message'] if entry_data['api_message'] is not None else ""
         items.append(QStandardItem(api_msg))
         return items
 
     def apply_status_coloring(self, item, status_text):
-        s_lower = str(status_text).lower(); color = QColor("gray")
-        if "active" in s_lower: color = QColor("darkGreen")
-        elif "expired" in s_lower: color = QColor("orange")
-        elif "banned" in s_lower or "disabled" in s_lower: color = QColor("red")
-        elif "auth failed" in s_lower: color = QColor(139,0,0)
-        elif "error" in s_lower or "failed" in s_lower and "auth failed" not in s_lower : color = QColor("magenta")
+        s_lower = str(status_text).lower()
+        # Default color will be the current text color from the stylesheet
+        # This ensures that if no specific rule matches, it uses the theme's default text color.
+        default_text_color = QGuiApplication.palette().text().color() # Get theme's default text color
+        color = default_text_color
+
+        if self.dark_theme_action.isChecked(): # Dark Theme Colors
+            if "active" in s_lower: color = QColor("white") # Changed to white for Dark Mode
+            elif "expired" in s_lower: color = QColor("#FF9800") # Orange
+            elif "banned" in s_lower or "disabled" in s_lower: color = QColor("#F44336") # Red
+            elif "auth failed" in s_lower: color = QColor("#B71C1C") # Darker Red
+            elif "error" in s_lower or "failed" in s_lower and "auth failed" not in s_lower : color = QColor("#E91E63") # Pink
+            # For "Not Checked" or other statuses in dark mode, let it use the default_text_color (usually light grey/white)
+            # else: color = QColor("#BDBDBD") # Explicit Grey, or rely on default_text_color
+        else: # Light Theme Colors
+            if "active" in s_lower: color = QColor("darkGreen") # Kept as darkGreen for Light Mode
+            elif "expired" in s_lower: color = QColor("orange")
+            elif "banned" in s_lower or "disabled" in s_lower: color = QColor("red")
+            elif "auth failed" in s_lower: color = QColor(139,0,0) # DarkRed
+            elif "error" in s_lower or "failed" in s_lower and "auth failed" not in s_lower : color = QColor("magenta")
+            else: color = QColor("gray") # Grey for "Not Checked" or other statuses in light mode
+
         item.setForeground(color)
 
     @Slot()
@@ -984,21 +1454,103 @@ class MainWindow(QMainWindow):
         if not file_path: return
         options_dialog = BatchImportOptionsDialog(parent=self)
         if not options_dialog.exec(): return
-        default_category = options_dialog.get_selected_category(); imported_count = 0; failed_count = 0
+        default_category = options_dialog.get_selected_category()
+        imported_count = 0
+        failed_count = 0
+
+        current_stalker_portal_url_for_mac_list = None
+        mac_pattern = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 for line_num, line in enumerate(f, 1):
-                    url_string = line.strip()
-                    if not url_string or url_string.startswith('#'): continue
-                    parsed_info = parse_get_php_url(url_string)
-                    if parsed_info and not parsed_info.get('error'):
+                    line_content = line.strip()
+                    if not line_content or line_content.startswith('#'):
+                        continue
+
+                    is_stalker_credential_string = line_content.startswith("stalker_portal:")
+                    is_xc_link = "get.php?" in line_content
+                    # Check for MAC pattern first, as URLs can be short and might be misidentified by simple http check alone
+                    is_potential_mac = mac_pattern.fullmatch(line_content) is not None # Use fullmatch for MAC
+
+                    # A line is a potential portal URL if it starts with http/https, is NOT an XC link, AND NOT a stalker credential string
+                    is_potential_portal_url = (line_content.startswith("http://") or line_content.startswith("https://")) \
+                                               and not is_xc_link and not is_stalker_credential_string
+
+                    if is_stalker_credential_string:
+                        current_stalker_portal_url_for_mac_list = None # Reset context
                         try:
-                            host = urlparse(parsed_info['server_base_url']).hostname or "host"; display_name = f"{host}_{parsed_info['username']}_L{line_num}"
-                            add_entry(display_name, default_category, parsed_info['server_base_url'], parsed_info['username'], parsed_info['password'])
+                            parts = line_content.split(',')
+                            if len(parts) < 2: raise ValueError("Malformed stalker string, missing comma.")
+                            portal_part_full = parts[0].strip()
+                            mac_part_full = parts[1].strip()
+
+                            if not portal_part_full.startswith("stalker_portal:") or not mac_part_full.startswith("mac:"):
+                                raise ValueError("Malformed stalker string, missing prefixes.")
+
+                            portal_url = portal_part_full.replace("stalker_portal:", "").strip()
+                            mac_address = mac_part_full.replace("mac:", "").strip().upper()
+
+                            if not (portal_url.startswith("http://") or portal_url.startswith("https://")):
+                                logging.warning(f"Batch Import: Invalid Stalker portal URL in string on line {line_num}: {portal_url}"); failed_count += 1; continue
+                            if not mac_pattern.fullmatch(mac_address): # Re-check MAC after parsing
+                                logging.warning(f"Batch Import: Invalid Stalker MAC address in string on line {line_num}: {mac_address}"); failed_count += 1; continue
+
+                            parsed_p_url = urlparse(portal_url)
+                            host = parsed_p_url.hostname or "stalker_host"
+                            display_name = f"{host}_{mac_address.replace(':', '')}_L{line_num}"
+                            server_base_url = f"{parsed_p_url.scheme}://{parsed_p_url.netloc}" if parsed_p_url.scheme and parsed_p_url.netloc else portal_url
+                            add_entry(display_name, default_category, server_base_url, "", "", account_type='stalker', mac_address=mac_address, portal_url=portal_url)
                             imported_count += 1
-                        except Exception as db_e: logging.error(f"Batch Import: DB error for URL '{url_string}': {db_e}"); failed_count += 1
-                    else: logging.warning(f"Batch Import: Failed to parse URL on line {line_num}: {url_string} - {parsed_info.get('error', 'Unknown') if parsed_info else 'None'}"); failed_count += 1
-            QMessageBox.information(self, "Batch Import Complete", f"Imported: {imported_count}\nFailed: {failed_count}\nSee log for details.")
+                            logging.info(f"Batch Import: Successfully imported Stalker credential string from line {line_num}")
+                        except Exception as e_stalker_str:
+                            logging.error(f"Batch Import: Error processing Stalker credential string on line {line_num} ('{line_content}'): {e_stalker_str}"); failed_count += 1
+
+                    elif is_xc_link:
+                        current_stalker_portal_url_for_mac_list = None # Reset context
+                        parsed_info = parse_get_php_url(line_content)
+                        if parsed_info and not parsed_info.get('error'):
+                            try:
+                                host = urlparse(parsed_info['server_base_url']).hostname or "host"
+                                display_name = f"{host}_{parsed_info['username']}_L{line_num}"
+                                add_entry(display_name, default_category, parsed_info['server_base_url'], parsed_info['username'], parsed_info['password'])
+                                imported_count += 1
+                            except Exception as db_e: logging.error(f"Batch Import: DB error for XC URL on line {line_num} ('{line_content}'): {db_e}"); failed_count += 1
+                        else:
+                            logging.warning(f"Batch Import: Failed to parse XC URL on line {line_num}: {line_content} - {parsed_info.get('error', 'Unknown') if parsed_info else 'None'}"); failed_count += 1
+
+                    elif is_potential_portal_url: # Must be checked AFTER specific formats (XC, stalker_portal:)
+                        parsed_val_url = urlparse(line_content)
+                        if parsed_val_url.scheme and parsed_val_url.netloc: # Basic validation
+                            current_stalker_portal_url_for_mac_list = line_content
+                            logging.info(f"Batch Import: Set current Stalker portal URL for subsequent MACs to: {current_stalker_portal_url_for_mac_list} (from line {line_num})")
+                        else:
+                            logging.warning(f"Batch Import: Skipped potential URL (malformed or unsupported) on line {line_num}: {line_content}")
+                            # current_stalker_portal_url_for_mac_list = None # Keep previous context or reset? Let's keep for now.
+                            failed_count +=1
+
+                    elif is_potential_mac and current_stalker_portal_url_for_mac_list:
+                        mac_address = line_content.strip().upper() # Already validated by is_potential_mac basically
+                        portal_url = current_stalker_portal_url_for_mac_list
+                        try:
+                            parsed_p_url = urlparse(portal_url)
+                            host = parsed_p_url.hostname or "stalker_host"
+                            display_name = f"{host}_{mac_address.replace(':', '')}_L{line_num}"
+                            server_base_url = f"{parsed_p_url.scheme}://{parsed_p_url.netloc}" if parsed_p_url.scheme and parsed_p_url.netloc else portal_url
+                            add_entry(display_name, default_category, server_base_url, "", "", account_type='stalker', mac_address=mac_address, portal_url=portal_url)
+                            imported_count += 1
+                            logging.info(f"Batch Import: Successfully imported Stalker MAC {mac_address} for portal {portal_url} from line {line_num}")
+                        except Exception as e_mac_list:
+                            logging.error(f"Batch Import: Error processing MAC {mac_address} for portal {portal_url} on line {line_num}: {e_mac_list}"); failed_count += 1
+
+                    else:
+                        if is_potential_mac and not current_stalker_portal_url_for_mac_list:
+                            logging.warning(f"Batch Import: Skipped MAC address {line_content} on line {line_num} as no Stalker Portal URL was previously defined in a block.")
+                        else:
+                            logging.warning(f"Batch Import: Skipped unrecognized line {line_num}: {line_content[:100]}...")
+                        failed_count += 1
+
+            QMessageBox.information(self, "Batch Import Complete", f"Imported: {imported_count}\nFailed/Skipped: {failed_count}\nSee log for details.")
             if imported_count > 0: self.load_entries_to_table(); self.update_category_filter_combo()
         except IOError as e: logging.error(f"Error reading import file '{file_path}': {e}"); QMessageBox.critical(self, "File Error", f"Could not read file: {e}")
         except Exception as e_gen: logging.error(f"Unexpected error during batch import: {e_gen}"); QMessageBox.critical(self, "Import Error", f"Unexpected error: {e_gen}")
@@ -1010,20 +1562,40 @@ class MainWindow(QMainWindow):
         if not entry_id_item: return None
 
         entry_id = entry_id_item.data(Qt.UserRole)
-        entry = get_entry_by_id(entry_id)
+        entry = get_entry_by_id(entry_id) # entry is an sqlite3.Row
         if entry:
-            return f"{entry['server_base_url']}/get.php?username={entry['username']}&password={entry['password']}&type=m3u_plus&output=ts"
+            account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
+            if account_type == 'stalker':
+                portal_url = entry['portal_url'] or ""
+                mac_address = entry['mac_address'] or ""
+                return f"stalker_portal:{portal_url},mac:{mac_address}"
+            else: # XC
+                return f"{entry['server_base_url']}/get.php?username={entry['username']}&password={entry['password']}&type=m3u_plus&output=ts"
         return None
 
     @Slot()
     def export_current_to_clipboard(self):
         current_proxy_index = self.table_view.currentIndex()
-        m3u_link = self.get_entry_data_for_export(current_proxy_index)
-        if m3u_link:
-            QGuiApplication.clipboard().setText(m3u_link)
-            self.status_bar.showMessage("M3U link copied to clipboard.", 3000)
+        export_string = self.get_entry_data_for_export(current_proxy_index)
+        if export_string:
+            QGuiApplication.clipboard().setText(export_string)
+
+            # Determine message based on what was copied
+            source_index = self.proxy_model.mapToSource(current_proxy_index)
+            entry_id_item = self.table_model.itemFromIndex(source_index.siblingAtColumn(COL_ID))
+            message = "Data copied to clipboard."
+            if entry_id_item:
+                entry_id = entry_id_item.data(Qt.UserRole)
+                db_entry = get_entry_by_id(entry_id)
+                if db_entry:
+                    account_type = db_entry['account_type'] if db_entry['account_type'] is not None else 'xc'
+                    if account_type == 'stalker':
+                        message = "Stalker credentials copied to clipboard."
+                    else:
+                        message = "XC API M3U link copied to clipboard."
+            self.status_bar.showMessage(message, 3000)
         else:
-            QMessageBox.warning(self, "Export Error", "Could not get data for the current entry.")
+            QMessageBox.warning(self, "Export Error", "Could not get data for the current entry to copy.")
 
     @Slot()
     def export_selected_to_txt(self):
@@ -1208,6 +1780,7 @@ class MainWindow(QMainWindow):
 
 
     def closeEvent(self, event):
+        self.save_settings() # Save settings on close
         if self._is_checking_api:
             reply = QMessageBox.question(self, "Confirm Exit", "API checks in progress. Exit anyway?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply == QMessageBox.Yes:
@@ -1223,6 +1796,75 @@ class MainWindow(QMainWindow):
         else:
             event.accept()
         logging.info(f"{APP_NAME} closing.")
+
+    def load_settings(self):
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, 'r') as f:
+                    settings = json.load(f)
+                    theme = settings.get("theme", "light") # Default to light theme
+                    self.set_theme(theme)
+            else:
+                self.set_theme("light") # Default to light theme if no settings file
+        except Exception as e:
+            logging.error(f"Error loading settings: {e}")
+            self.set_theme("light") # Default to light theme on error
+
+    def save_settings(self):
+        try:
+            settings = {
+                "theme": "dark" if self.dark_theme_action.isChecked() else "light"
+            }
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            logging.error(f"Error saving settings: {e}")
+
+    def set_theme(self, theme_name):
+        # TODO: Implement actual theme switching logic
+        if theme_name == "light":
+            self.light_theme_action.setChecked(True)
+            self.dark_theme_action.setChecked(False)
+            QApplication.instance().setStyleSheet("""
+                QWidget { background-color: #f0f0f0; color: #333; }
+                QTableView { background-color: white; selection-background-color: #a6cfff; }
+                QHeaderView::section { background-color: #e0e0e0; }
+                QPushButton { background-color: #d0d0d0; border: 1px solid #b0b0b0; padding: 5px; }
+                QPushButton:hover { background-color: #c0c0c0; }
+                QLineEdit, QComboBox { background-color: white; border: 1px solid #ccc; padding: 3px; }
+            """)
+        elif theme_name == "dark":
+            self.dark_theme_action.setChecked(True)
+            self.light_theme_action.setChecked(False)
+            QApplication.instance().setStyleSheet("""
+                QWidget { background-color: #2e2e2e; color: #f0f0f0; }
+                QTableView { background-color: #3e3e3e; selection-background-color: #5a5a5a; }
+                QHeaderView::section { background-color: #4e4e4e; }
+                QPushButton { background-color: #5e5e5e; border: 1px solid #7e7e7e; padding: 5px; }
+                QPushButton:hover { background-color: #6e6e6e; }
+                QLineEdit, QComboBox { background-color: #4e4e4e; border: 1px solid #6e6e6e; padding: 3px; }
+                QMenu { background-color: #3e3e3e; color: #f0f0f0; }
+                QMenu::item:selected { background-color: #5a5a5a; }
+                QStatusBar { background-color: #2e2e2e; }
+            """)
+        self.save_settings()
+        self.refresh_table_coloring_on_theme_change() # Add this call
+
+    def refresh_table_coloring_on_theme_change(self):
+        """Refreshes the coloring of status items in the table after a theme change."""
+        if not hasattr(self, 'table_model') or self.table_model is None:
+            return
+
+        logging.debug("Refreshing table item coloring due to theme change.")
+        for row in range(self.table_model.rowCount()):
+            # Assuming COL_STATUS is the correct column index for the API status
+            status_item = self.table_model.item(row, COL_STATUS)
+            if status_item:
+                status_text = status_item.text()
+                self.apply_status_coloring(status_item, status_text)
+        # If using a proxy model, you might need to trigger an update for the view,
+        # but changing item properties directly often reflects. If not, further signals might be needed.
+
 
 # =============================================================================
 # APPLICATION ENTRY POINT
@@ -1247,4 +1889,3 @@ if __name__ == "__main__":
     main_window = MainWindow()
     main_window.show()
     sys.exit(app.exec())
-

@@ -8,6 +8,7 @@ import json
 import logging
 import time
 import re # Added for MAC address validation
+from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone, timedelta

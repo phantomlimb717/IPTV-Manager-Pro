@@ -1346,22 +1346,26 @@ class MainWindow(QMainWindow):
     def apply_status_coloring(self, item, status_text):
         s_lower = str(status_text).lower()
         # Default color will be the current text color from the stylesheet
-        color = item.foreground().color()
+        # This ensures that if no specific rule matches, it uses the theme's default text color.
+        default_text_color = QGuiApplication.palette().text().color() # Get theme's default text color
+        color = default_text_color
 
         if self.dark_theme_action.isChecked(): # Dark Theme Colors
-            if "active" in s_lower: color = QColor("#4CAF50") # Green
+            if "active" in s_lower: color = QColor("white") # Changed to white for Dark Mode
             elif "expired" in s_lower: color = QColor("#FF9800") # Orange
             elif "banned" in s_lower or "disabled" in s_lower: color = QColor("#F44336") # Red
             elif "auth failed" in s_lower: color = QColor("#B71C1C") # Darker Red
             elif "error" in s_lower or "failed" in s_lower and "auth failed" not in s_lower : color = QColor("#E91E63") # Pink
-            else: color = QColor("#BDBDBD") # Grey for "Not Checked" or other statuses
-        else: # Light Theme Colors (similar to original, but can be adjusted)
-            if "active" in s_lower: color = QColor("darkGreen")
+            # For "Not Checked" or other statuses in dark mode, let it use the default_text_color (usually light grey/white)
+            # else: color = QColor("#BDBDBD") # Explicit Grey, or rely on default_text_color
+        else: # Light Theme Colors
+            if "active" in s_lower: color = QColor("darkGreen") # Kept as darkGreen for Light Mode
             elif "expired" in s_lower: color = QColor("orange")
             elif "banned" in s_lower or "disabled" in s_lower: color = QColor("red")
             elif "auth failed" in s_lower: color = QColor(139,0,0) # DarkRed
             elif "error" in s_lower or "failed" in s_lower and "auth failed" not in s_lower : color = QColor("magenta")
-            else: color = QColor("gray") # Grey for "Not Checked" or other statuses
+            else: color = QColor("gray") # Grey for "Not Checked" or other statuses in light mode
+
         item.setForeground(color)
 
     @Slot()

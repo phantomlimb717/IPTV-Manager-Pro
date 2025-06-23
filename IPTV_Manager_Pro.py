@@ -715,7 +715,8 @@ class EntryDialog(QDialog):
             entry = get_entry_by_id(self.entry_id)
             if entry:
                 self.name_edit.setText(entry['name'])
-                current_account_type = entry.get('account_type', 'xc') # Default to 'xc' if not set
+                # entry is an sqlite3.Row object.
+                current_account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
                 type_display_name = "Stalker Portal" if current_account_type == 'stalker' else "Xtream Codes API"
                 self.account_type_combo.setCurrentText(type_display_name)
                 self.toggle_input_fields(type_display_name) # Ensure fields are visible before setting text
@@ -1004,7 +1005,8 @@ class ApiCheckerWorker(QObject):
                     self.progress_updated.emit(processed_count, total)
                     continue
 
-                account_type = entry_data.get('account_type', 'xc') # Default to 'xc'
+                # entry_data is an sqlite3.Row object.
+                account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
                 api_result = None
 
                 if account_type == 'stalker':
@@ -1308,13 +1310,16 @@ class MainWindow(QMainWindow):
             except Exception as e: logging.warning(f"Error parsing last_checked_at '{last_chk_raw}': {e}")
         items.append(QStandardItem(last_chk_disp))
 
-        account_type = entry_data.get('account_type', 'xc')
+        # entry_data is an sqlite3.Row object. Access columns using dictionary-style access.
+        # The 'account_type' column should exist due to migrations, defaulting to 'xc'.
+        account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
+
         if account_type == 'stalker':
-            items.append(QStandardItem(entry_data.get('portal_url', 'N/A'))) # Server column
-            items.append(QStandardItem(entry_data.get('mac_address', 'N/A'))) # Username column, now User/MAC
-        else: # XC
-            items.append(QStandardItem(entry_data['server_base_url']))
-            items.append(QStandardItem(entry_data['username']))
+            items.append(QStandardItem(entry_data['portal_url'] or 'N/A')) # Server column
+            items.append(QStandardItem(entry_data['mac_address'] or 'N/A')) # Username column, now User/MAC
+        else: # XC or if somehow account_type is None and defaulted to 'xc'
+            items.append(QStandardItem(entry_data['server_base_url'] or 'N/A'))
+            items.append(QStandardItem(entry_data['username'] or 'N/A'))
 
         api_msg = entry_data['api_message'] if entry_data['api_message'] is not None else ""
         items.append(QStandardItem(api_msg))

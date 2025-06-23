@@ -61,6 +61,7 @@ LOG_FILE = 'iptv_manager_log.txt'
 USER_AGENT = f'{APP_NAME}/{APP_VERSION} (okhttp/3.12.1)'
 API_TIMEOUT = 15
 REQUEST_DELAY_BETWEEN_CHECKS = 0.2
+SETTINGS_FILE = "settings.json"
 
 REPORT_DISPLAY_TIMEZONE = "America/Los_Angeles" # Example
 try:
@@ -353,7 +354,7 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
         api_status_val = get_safe_api_value(user_info, 'status')
         if api_status_val is not None:
              processed_data['api_status'] = api_status_val
-        
+
         user_info_message = get_safe_api_value(user_info, 'message', '')
         if user_info_message:
              processed_data['api_message'] = f"{current_api_msg} {user_info_message}".strip() if current_api_msg else user_info_message
@@ -394,7 +395,7 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
             except (ValueError, TypeError):
                 logging.warning(f"API Check {username}: Invalid max_connections format '{max_c_raw}'")
                 pass
-        
+
         if processed_data['success'] and processed_data['api_status'] in [None, 'Unknown'] and not processed_data['api_message']:
             processed_data['api_message'] = "Valid connection but key data missing from API."
 
@@ -415,7 +416,7 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
     except Exception as e:
         processed_data['api_message'] = f"Unexpected API Error: {type(e).__name__}"
         logging.exception(f"Unexpected error during API check for {username}.")
-    
+
     processed_data['success'] = False
     return processed_data
 
@@ -755,79 +756,143 @@ class MainWindow(QMainWindow):
         self.load_entries_to_table()
         self.update_category_filter_combo()
         self.update_action_button_states()
+        self.load_settings() # Load settings on startup
         # *** MODIFIED LINE ***
         # Use the resource_path helper to find the icon, both in development and in the PyInstaller bundle.
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
 
     def setup_ui(self):
-        menubar = self.menuBar(); file_menu = menubar.addMenu("&File")
-        import_url_action = QAction("Import from &URL...", self); import_url_action.triggered.connect(self.import_from_url_action); file_menu.addAction(import_url_action)
-        import_file_action = QAction("Import from &File...", self); import_file_action.triggered.connect(self.import_from_file_action); file_menu.addAction(import_file_action)
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("&File")
+        import_url_action = QAction("Import from &URL...", self)
+        import_url_action.triggered.connect(self.import_from_url_action)
+        file_menu.addAction(import_url_action)
+        import_file_action = QAction("Import from &File...", self)
+        import_file_action.triggered.connect(self.import_from_file_action)
+        file_menu.addAction(import_file_action)
         file_menu.addSeparator()
-        export_clipboard_action = QAction("Copy Link for Current Entry", self); export_clipboard_action.triggered.connect(self.export_current_to_clipboard); file_menu.addAction(export_clipboard_action)
-        export_txt_action = QAction("Export Links for Selected Entries...", self); export_txt_action.triggered.connect(self.export_selected_to_txt); file_menu.addAction(export_txt_action)
+        export_clipboard_action = QAction("Copy Link for Current Entry", self)
+        export_clipboard_action.triggered.connect(self.export_current_to_clipboard)
+        file_menu.addAction(export_clipboard_action)
+        export_txt_action = QAction("Export Links for Selected Entries...", self)
+        export_txt_action.triggered.connect(self.export_selected_to_txt)
+        file_menu.addAction(export_txt_action)
         file_menu.addSeparator()
-        exit_action = QAction("&Exit", self); exit_action.setShortcut(QKeySequence.Quit); exit_action.triggered.connect(self.close); file_menu.addAction(exit_action)
 
-        main_widget = QWidget(); main_layout = QVBoxLayout(main_widget)
+        # Theme selection
+        theme_menu = file_menu.addMenu("&Theme")
+        self.light_theme_action = QAction("Light Mode", self, checkable=True)
+        self.light_theme_action.triggered.connect(lambda: self.set_theme("light"))
+        theme_menu.addAction(self.light_theme_action)
+        self.dark_theme_action = QAction("Dark Mode", self, checkable=True)
+        self.dark_theme_action.triggered.connect(lambda: self.set_theme("dark"))
+        theme_menu.addAction(self.dark_theme_action)
+        file_menu.addSeparator()
+
+        exit_action = QAction("&Exit", self)
+        exit_action.setShortcut(QKeySequence.Quit)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        main_widget = QWidget()
+        main_layout = QVBoxLayout(main_widget)
 
         top_controls_layout = QHBoxLayout()
-        self.add_button = QPushButton("Add Entry"); self.edit_button = QPushButton("Edit Selected")
+        self.add_button = QPushButton("Add Entry")
+        self.edit_button = QPushButton("Edit Selected")
         self.delete_button = QPushButton("Delete Selected")
-        self.import_url_button = QPushButton("Import URL"); self.import_file_button = QPushButton("Import File")
+        self.import_url_button = QPushButton("Import URL")
+        self.import_file_button = QPushButton("Import File")
 
-        top_controls_layout.addWidget(self.add_button); top_controls_layout.addWidget(self.edit_button); top_controls_layout.addWidget(self.delete_button)
-        top_controls_layout.addSpacing(10); top_controls_layout.addWidget(self.import_url_button); top_controls_layout.addWidget(self.import_file_button)
-        top_controls_layout.addStretch(); main_layout.addLayout(top_controls_layout)
+        top_controls_layout.addWidget(self.add_button)
+        top_controls_layout.addWidget(self.edit_button)
+        top_controls_layout.addWidget(self.delete_button)
+        top_controls_layout.addSpacing(10)
+        top_controls_layout.addWidget(self.import_url_button)
+        top_controls_layout.addWidget(self.import_file_button)
+        top_controls_layout.addStretch()
+        main_layout.addLayout(top_controls_layout)
 
         export_buttons_layout = QHBoxLayout()
-        self.export_clipboard_button = QPushButton("Copy Link (Current)"); export_buttons_layout.addWidget(self.export_clipboard_button)
-        self.export_txt_button = QPushButton("Export Links (Selected)"); export_buttons_layout.addWidget(self.export_txt_button)
+        self.export_clipboard_button = QPushButton("Copy Link (Current)")
+        export_buttons_layout.addWidget(self.export_clipboard_button)
+        self.export_txt_button = QPushButton("Export Links (Selected)")
+        export_buttons_layout.addWidget(self.export_txt_button)
         export_buttons_layout.addStretch()
         top_controls_layout.addSpacing(20)
         top_controls_layout.addWidget(self.export_clipboard_button)
         top_controls_layout.addWidget(self.export_txt_button)
 
         secondary_controls_layout = QHBoxLayout()
-        self.check_selected_button = QPushButton("Check Selected"); self.check_all_button = QPushButton("Check All Visible")
+        self.check_selected_button = QPushButton("Check Selected")
+        self.check_all_button = QPushButton("Check All Visible")
         self.manage_categories_button = QPushButton("Categories...")
-        secondary_controls_layout.addWidget(self.check_selected_button); secondary_controls_layout.addWidget(self.check_all_button)
-        secondary_controls_layout.addStretch(); secondary_controls_layout.addWidget(self.manage_categories_button); main_layout.addLayout(secondary_controls_layout)
+        secondary_controls_layout.addWidget(self.check_selected_button)
+        secondary_controls_layout.addWidget(self.check_all_button)
+        secondary_controls_layout.addStretch()
+        secondary_controls_layout.addWidget(self.manage_categories_button)
+        main_layout.addLayout(secondary_controls_layout)
 
         filter_controls_layout = QHBoxLayout()
         filter_controls_layout.addWidget(QLabel("Search:"))
-        self.search_edit = QLineEdit(); self.search_edit.setPlaceholderText("Type to search..."); filter_controls_layout.addWidget(self.search_edit)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Type to search...")
+        filter_controls_layout.addWidget(self.search_edit)
         filter_controls_layout.addSpacing(10)
         filter_controls_layout.addWidget(QLabel("Category:"))
-        self.category_filter_combo = QComboBox(); self.category_filter_combo.setMinimumWidth(150); filter_controls_layout.addWidget(self.category_filter_combo)
-        self.exclude_na_button = QPushButton("Exclude N/A"); self.exclude_na_button.setCheckable(True); filter_controls_layout.addWidget(self.exclude_na_button)
-        filter_controls_layout.addStretch(); main_layout.addLayout(filter_controls_layout)
+        self.category_filter_combo = QComboBox()
+        self.category_filter_combo.setMinimumWidth(150)
+        filter_controls_layout.addWidget(self.category_filter_combo)
+        self.exclude_na_button = QPushButton("Exclude N/A")
+        self.exclude_na_button.setCheckable(True)
+        filter_controls_layout.addWidget(self.exclude_na_button)
+        filter_controls_layout.addStretch()
+        main_layout.addLayout(filter_controls_layout)
 
-        self.table_view = QTableView(); self.table_model = QStandardItemModel(0, len(COLUMN_HEADERS))
-        self.table_model.setHorizontalHeaderLabels(COLUMN_HEADERS);
+        self.table_view = QTableView()
+        self.table_model = QStandardItemModel(0, len(COLUMN_HEADERS))
+        self.table_model.setHorizontalHeaderLabels(COLUMN_HEADERS)
         self.proxy_model = EntryFilterProxyModel(self)
-        self.proxy_model.setSourceModel(self.table_model); self.table_view.setModel(self.proxy_model)
+        self.proxy_model.setSourceModel(self.table_model)
+        self.table_view.setModel(self.proxy_model)
 
-        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows); self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table_view.setEditTriggers(QAbstractItemView.NoEditTriggers); self.table_view.setSortingEnabled(True)
-        self.table_view.sortByColumn(COL_NAME, Qt.AscendingOrder); header = self.table_view.horizontalHeader()
+        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_view.setSortingEnabled(True)
+        self.table_view.sortByColumn(COL_NAME, Qt.AscendingOrder)
+        header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(COL_ID, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_NAME, QHeaderView.Interactive); self.table_view.setColumnWidth(COL_NAME, 200)
-        header.setSectionResizeMode(COL_CATEGORY, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_EXPIRY, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_TRIAL, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_ACTIVE_CONN, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_MAX_CONN, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_NAME, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_NAME, 200)
+        header.setSectionResizeMode(COL_CATEGORY, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_EXPIRY, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_TRIAL, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_ACTIVE_CONN, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_MAX_CONN, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_LAST_CHECKED, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_SERVER, QHeaderView.Interactive); self.table_view.setColumnWidth(COL_SERVER, 150)
-        header.setSectionResizeMode(COL_USER, QHeaderView.ResizeToContents); header.setSectionResizeMode(COL_MSG, QHeaderView.Stretch)
-        main_layout.addWidget(self.table_view); self.setCentralWidget(main_widget)
-        self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
-        self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False); self.progress_bar.setTextVisible(True)
+        header.setSectionResizeMode(COL_SERVER, QHeaderView.Interactive)
+        self.table_view.setColumnWidth(COL_SERVER, 150)
+        header.setSectionResizeMode(COL_USER, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_MSG, QHeaderView.Stretch)
+        main_layout.addWidget(self.table_view)
+        self.setCentralWidget(main_widget)
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(True)
         self.status_bar.addPermanentWidget(self.progress_bar)
 
-        self.add_button.clicked.connect(self.add_entry_action); self.edit_button.clicked.connect(self.edit_entry_action)
-        self.delete_button.clicked.connect(self.delete_entry_action); self.import_url_button.clicked.connect(self.import_from_url_action)
-        self.import_file_button.clicked.connect(self.import_from_file_action); self.manage_categories_button.clicked.connect(self.manage_categories_action)
-        self.check_selected_button.clicked.connect(self.check_selected_entries_action); self.check_all_button.clicked.connect(self.check_all_entries_action)
+        self.add_button.clicked.connect(self.add_entry_action)
+        self.edit_button.clicked.connect(self.edit_entry_action)
+        self.delete_button.clicked.connect(self.delete_entry_action)
+        self.import_url_button.clicked.connect(self.import_from_url_action)
+        self.import_file_button.clicked.connect(self.import_from_file_action)
+        self.manage_categories_button.clicked.connect(self.manage_categories_action)
+        self.check_selected_button.clicked.connect(self.check_selected_entries_action)
+        self.check_all_button.clicked.connect(self.check_all_entries_action)
         self.export_clipboard_button.clicked.connect(self.export_current_to_clipboard)
         self.export_txt_button.clicked.connect(self.export_selected_to_txt)
 
@@ -890,12 +955,24 @@ class MainWindow(QMainWindow):
         return items
 
     def apply_status_coloring(self, item, status_text):
-        s_lower = str(status_text).lower(); color = QColor("gray")
-        if "active" in s_lower: color = QColor("darkGreen")
-        elif "expired" in s_lower: color = QColor("orange")
-        elif "banned" in s_lower or "disabled" in s_lower: color = QColor("red")
-        elif "auth failed" in s_lower: color = QColor(139,0,0)
-        elif "error" in s_lower or "failed" in s_lower and "auth failed" not in s_lower : color = QColor("magenta")
+        s_lower = str(status_text).lower()
+        # Default color will be the current text color from the stylesheet
+        color = item.foreground().color()
+
+        if self.dark_theme_action.isChecked(): # Dark Theme Colors
+            if "active" in s_lower: color = QColor("#4CAF50") # Green
+            elif "expired" in s_lower: color = QColor("#FF9800") # Orange
+            elif "banned" in s_lower or "disabled" in s_lower: color = QColor("#F44336") # Red
+            elif "auth failed" in s_lower: color = QColor("#B71C1C") # Darker Red
+            elif "error" in s_lower or "failed" in s_lower and "auth failed" not in s_lower : color = QColor("#E91E63") # Pink
+            else: color = QColor("#BDBDBD") # Grey for "Not Checked" or other statuses
+        else: # Light Theme Colors (similar to original, but can be adjusted)
+            if "active" in s_lower: color = QColor("darkGreen")
+            elif "expired" in s_lower: color = QColor("orange")
+            elif "banned" in s_lower or "disabled" in s_lower: color = QColor("red")
+            elif "auth failed" in s_lower: color = QColor(139,0,0) # DarkRed
+            elif "error" in s_lower or "failed" in s_lower and "auth failed" not in s_lower : color = QColor("magenta")
+            else: color = QColor("gray") # Grey for "Not Checked" or other statuses
         item.setForeground(color)
 
     @Slot()
@@ -1208,6 +1285,7 @@ class MainWindow(QMainWindow):
 
 
     def closeEvent(self, event):
+        self.save_settings() # Save settings on close
         if self._is_checking_api:
             reply = QMessageBox.question(self, "Confirm Exit", "API checks in progress. Exit anyway?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply == QMessageBox.Yes:
@@ -1223,6 +1301,59 @@ class MainWindow(QMainWindow):
         else:
             event.accept()
         logging.info(f"{APP_NAME} closing.")
+
+    def load_settings(self):
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, 'r') as f:
+                    settings = json.load(f)
+                    theme = settings.get("theme", "light") # Default to light theme
+                    self.set_theme(theme)
+            else:
+                self.set_theme("light") # Default to light theme if no settings file
+        except Exception as e:
+            logging.error(f"Error loading settings: {e}")
+            self.set_theme("light") # Default to light theme on error
+
+    def save_settings(self):
+        try:
+            settings = {
+                "theme": "dark" if self.dark_theme_action.isChecked() else "light"
+            }
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            logging.error(f"Error saving settings: {e}")
+
+    def set_theme(self, theme_name):
+        # TODO: Implement actual theme switching logic
+        if theme_name == "light":
+            self.light_theme_action.setChecked(True)
+            self.dark_theme_action.setChecked(False)
+            QApplication.instance().setStyleSheet("""
+                QWidget { background-color: #f0f0f0; color: #333; }
+                QTableView { background-color: white; selection-background-color: #a6cfff; }
+                QHeaderView::section { background-color: #e0e0e0; }
+                QPushButton { background-color: #d0d0d0; border: 1px solid #b0b0b0; padding: 5px; }
+                QPushButton:hover { background-color: #c0c0c0; }
+                QLineEdit, QComboBox { background-color: white; border: 1px solid #ccc; padding: 3px; }
+            """)
+        elif theme_name == "dark":
+            self.dark_theme_action.setChecked(True)
+            self.light_theme_action.setChecked(False)
+            QApplication.instance().setStyleSheet("""
+                QWidget { background-color: #2e2e2e; color: #f0f0f0; }
+                QTableView { background-color: #3e3e3e; selection-background-color: #5a5a5a; }
+                QHeaderView::section { background-color: #4e4e4e; }
+                QPushButton { background-color: #5e5e5e; border: 1px solid #7e7e7e; padding: 5px; }
+                QPushButton:hover { background-color: #6e6e6e; }
+                QLineEdit, QComboBox { background-color: #4e4e4e; border: 1px solid #6e6e6e; padding: 3px; }
+                QMenu { background-color: #3e3e3e; color: #f0f0f0; }
+                QMenu::item:selected { background-color: #5a5a5a; }
+                QStatusBar { background-color: #2e2e2e; }
+            """)
+        self.save_settings()
+
 
 # =============================================================================
 # APPLICATION ENTRY POINT
@@ -1247,4 +1378,3 @@ if __name__ == "__main__":
     main_window = MainWindow()
     main_window.show()
     sys.exit(app.exec())
-

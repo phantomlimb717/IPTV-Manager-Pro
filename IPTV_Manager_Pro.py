@@ -1848,6 +1848,22 @@ class MainWindow(QMainWindow):
                 QStatusBar { background-color: #2e2e2e; }
             """)
         self.save_settings()
+        self.refresh_table_coloring_on_theme_change() # Add this call
+
+    def refresh_table_coloring_on_theme_change(self):
+        """Refreshes the coloring of status items in the table after a theme change."""
+        if not hasattr(self, 'table_model') or self.table_model is None:
+            return
+
+        logging.debug("Refreshing table item coloring due to theme change.")
+        for row in range(self.table_model.rowCount()):
+            # Assuming COL_STATUS is the correct column index for the API status
+            status_item = self.table_model.item(row, COL_STATUS)
+            if status_item:
+                status_text = status_item.text()
+                self.apply_status_coloring(status_item, status_text)
+        # If using a proxy model, you might need to trigger an update for the view,
+        # but changing item properties directly often reflects. If not, further signals might be needed.
 
 
 # =============================================================================

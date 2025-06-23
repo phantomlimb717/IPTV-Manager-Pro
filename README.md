@@ -12,7 +12,7 @@ A desktop application for managing and checking the status of IPTV account crede
     - **Stalker Portal:** Add accounts using Portal URL and MAC Address. Status checking will verify MAC activation and expiry.
 - **Batch Import:** Import multiple accounts from a text file. Supports:
     - Xtream Codes API `get.php` style URLs.
-    - Stalker Portal credentials in the format `stalker_portal:URL,mac:MAC_ADDRESS`.
+    - Stalker Portal credentials in the formats listed below.
 - **Status Checking:** Check account status (including expiry date, active/max connections for Xtream Codes API) for both Xtream Codes and Stalker Portal type accounts.
 - **Categorization:** Organize your entries into custom categories.
 - **Advanced Filtering:** Quickly search the list by any field and filter by category.

@@ -7,6 +7,7 @@ import sqlite3
 import json
 import logging
 import time
+import re # Added for MAC address validation
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone, timedelta
@@ -117,9 +118,29 @@ def initialize_database():
                 max_connections INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 raw_user_info TEXT,
-                raw_server_info TEXT
+                raw_server_info TEXT,
+                account_type TEXT DEFAULT 'xc',
+                mac_address TEXT,
+                portal_url TEXT
             )
         ''')
+        # Add new columns if they don't exist (for existing databases)
+        try:
+            cursor.execute("SELECT account_type FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'account_type' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN account_type TEXT DEFAULT 'xc'")
+        try:
+            cursor.execute("SELECT mac_address FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'mac_address' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN mac_address TEXT")
+        try:
+            cursor.execute("SELECT portal_url FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'portal_url' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN portal_url TEXT")
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,29 +158,30 @@ def initialize_database():
     finally:
         if conn: conn.close()
 
-def add_entry(name, category, server_url, username, password):
+def add_entry(name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None):
     conn = get_db_connection()
     try:
         cursor = conn.execute('''
-            INSERT INTO entries (name, category, server_base_url, username, password)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (name, category, server_url, username, password))
+            INSERT INTO entries (name, category, server_base_url, username, password, account_type, mac_address, portal_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url))
         conn.commit()
         entry_id = cursor.lastrowid
-        logging.info(f"Added entry: {name} (ID: {entry_id})")
+        logging.info(f"Added entry: {name} (ID: {entry_id}, Type: {account_type})")
         return entry_id
     finally: conn.close()
 
-def update_entry(entry_id, name, category, server_url, username, password):
+def update_entry(entry_id, name, category, server_url, username, password, account_type='xc', mac_address=None, portal_url=None):
     conn = get_db_connection()
     try:
         conn.execute('''
             UPDATE entries
-            SET name = ?, category = ?, server_base_url = ?, username = ?, password = ?
+            SET name = ?, category = ?, server_base_url = ?, username = ?, password = ?,
+                account_type = ?, mac_address = ?, portal_url = ?
             WHERE id = ?
-        ''', (name, category, server_url, username, password, entry_id))
+        ''', (name, category, server_url, username, password, account_type, mac_address, portal_url, entry_id))
         conn.commit()
-        logging.info(f"Updated entry ID: {entry_id}")
+        logging.info(f"Updated entry ID: {entry_id} (Type: {account_type})")
     finally: conn.close()
 
 def delete_entry(entry_id):
@@ -420,6 +442,193 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
     processed_data['success'] = False
     return processed_data
 
+# --- Stalker Portal API Functions ---
+STALKER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+STALKER_COMMON_HEADERS = {
+    'User-Agent': STALKER_USER_AGENT,
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'X-Requested-With': 'XMLHttpRequest',
+}
+
+def _get_stalker_token(session: requests.Session, portal_url: str, mac_address: str) -> Optional[str]:
+    """Performs handshake and retrieves token for Stalker Portal."""
+    handshake_url = f"{portal_url.rstrip('/')}/portal.php?action=handshake&type=stb&token=&JsHttpRequest=1-xml"
+    headers = {**STALKER_COMMON_HEADERS, 'Authorization': f"MAC {mac_address}"}
+    # Stalker portals often expect the MAC as a cookie as well
+    session.cookies.update({"mac": mac_address.replace(":", "").lower()}) # Common format for cookie MAC
+    session.headers.update({'Referer': f"{portal_url.rstrip('/')}/c/"})
+
+
+    logging.info(f"Stalker: Attempting handshake with {portal_url} for MAC {mac_address}")
+    try:
+        response = session.get(handshake_url, headers=headers, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        token = data.get("js", {}).get("token")
+        if token:
+            logging.info(f"Stalker: Handshake successful, token received for MAC {mac_address}")
+            return token
+        else:
+            logging.warning(f"Stalker: Handshake response did not contain token for MAC {mac_address}. Response: {response.text[:200]}")
+            return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Stalker: Handshake request exception for MAC {mac_address} to {portal_url}: {e}")
+    except json.JSONDecodeError as e:
+        logging.error(f"Stalker: Handshake JSON decode error for MAC {mac_address} to {portal_url}: {e}. Response: {response.text[:200] if 'response' in locals() else 'N/A'}")
+    except KeyError as e:
+        logging.error(f"Stalker: Handshake Key error (likely missing 'js' or 'token') for MAC {mac_address}: {e}. Response: {response.text[:200] if 'response' in locals() else 'N/A'}")
+    return None
+
+def check_stalker_portal_status(portal_url: str, mac_address: str, session: requests.Session):
+    processed_data = {
+        'success': False, 'api_status': "Error", 'api_message': "Check init error (Stalker)",
+        'expiry_date_ts': None, 'is_trial': None, 'active_connections': None, # Stalker might not provide these
+        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None # server_info not typical for Stalker
+    }
+
+    if not all([portal_url, mac_address, session]):
+        processed_data['api_message'] = "Internal Error: Missing parameters for Stalker API call"
+        return processed_data
+
+    # Ensure MAC address is in the common format for headers/cookies if needed
+    formatted_mac = mac_address.upper() # For Authorization header
+    # cookie_mac = mac_address.replace(":", "").lower() # Example for cookie, if portal expects it specifically
+
+    token = _get_stalker_token(session, portal_url, formatted_mac)
+
+    if not token:
+        processed_data['api_message'] = "Stalker Handshake Failed: Could not get token."
+        # Log already done in _get_stalker_token
+        return processed_data
+
+    account_info_url = f"{portal_url.rstrip('/')}/portal.php?type=account_info&action=get_main_info&JsHttpRequest=1-xml"
+    headers = {**STALKER_COMMON_HEADERS, 'Authorization': f"Bearer {token}"}
+    # Referer is typically set on the session already by _get_stalker_token
+
+    logging.info(f"Stalker: Getting account info from {portal_url} for MAC {formatted_mac}")
+    response_text = None
+    try:
+        response = session.get(account_info_url, headers=headers, timeout=API_TIMEOUT)
+        response_text = response.text
+        response.raise_for_status()
+        data = response.json()
+        user_info = data.get("js", {})
+
+        processed_data['raw_user_info'] = json.dumps(user_info)
+
+        if not isinstance(user_info, dict):
+            processed_data['api_message'] = "Invalid 'user_info' format (Stalker)"
+            processed_data['success'] = False
+            return processed_data
+
+        # Stalker portals use various fields for status and expiry.
+        # Common ones include 'status', 'exp_date' (unix timestamp or string), or sometimes in 'data' sub-object.
+        # The `maclist.py` example used `phone` for expiry, which is unusual. Let's be flexible.
+
+        # Infer status:
+        # A common pattern is status=1 means active, status=0 or 2 might mean inactive/expired.
+        # If 'status' field exists and is 0 or 2, it's likely not active.
+        # If 'exp_date' is in the past, it's expired.
+
+        api_status_val = user_info.get('status')
+        if api_status_val is not None:
+            api_status_str = str(api_status_val).lower()
+            if api_status_str == '1':
+                processed_data['api_status'] = "Active"
+            elif api_status_str == '0' or api_status_str == '2':
+                 processed_data['api_status'] = "Inactive/Disabled" # More specific than just "Expired"
+            else:
+                processed_data['api_status'] = f"Status: {api_status_val}"
+        else:
+            # If no explicit status, we'll rely on expiry date or assume active if expiry is future/valid.
+            processed_data['api_status'] = "Info Retrieved" # Placeholder, will be updated by expiry logic
+
+        # Expiry Date Handling:
+        # Stalker portals can have 'exp_date' as a unix timestamp or a string 'YYYY-MM-DD HH:MM:SS' or 'DD.MM.YYYY'.
+        # The example `maclist.py` used 'phone' for expiry.
+        exp_date_raw = user_info.get('exp_date') # Primary target
+        if exp_date_raw is None:
+            exp_date_raw = user_info.get('expire_date') # Secondary common target
+        if exp_date_raw is None:
+            exp_date_raw = user_info.get('phone') # Fallback from maclist.py example
+
+        if exp_date_raw is not None:
+            try:
+                # Attempt to parse as Unix timestamp first
+                exp_ts = int(float(exp_date_raw))
+                if exp_ts > 0 : processed_data['expiry_date_ts'] = exp_ts
+            except (ValueError, TypeError):
+                # Attempt to parse as string date
+                try:
+                    # Example: "2023-12-31 23:59:59" or "31.12.2023"
+                    # This needs more robust parsing if multiple formats are common.
+                    # For now, let's assume a common format if it's a string.
+                    # A simple check for now; real parsing might need dateutil.parser
+                    if isinstance(exp_date_raw, str):
+                        if ' ' in exp_date_raw and ':' in exp_date_raw: # Likely "YYYY-MM-DD HH:MM:SS"
+                            dt_obj = datetime.strptime(exp_date_raw, '%Y-%m-%d %H:%M:%S')
+                        elif '.' in exp_date_raw and len(exp_date_raw) == 10: # Likely "DD.MM.YYYY"
+                            dt_obj = datetime.strptime(exp_date_raw, '%d.%m.%Y')
+                        else: # Add more formats if needed
+                            dt_obj = None
+
+                        if dt_obj:
+                            processed_data['expiry_date_ts'] = int(dt_obj.replace(tzinfo=timezone.utc).timestamp())
+                        else:
+                            logging.warning(f"Stalker: Unparseable string exp_date '{exp_date_raw}' for MAC {formatted_mac}")
+                            processed_data['api_message'] = f"Expiry date format unknown: {str(exp_date_raw)[:30]}"
+                    else:
+                        logging.warning(f"Stalker: Invalid exp_date format '{exp_date_raw}' for MAC {formatted_mac}")
+
+                except (ValueError, TypeError) as date_parse_err:
+                    logging.warning(f"Stalker: Error parsing exp_date string '{exp_date_raw}' for MAC {formatted_mac}: {date_parse_err}")
+                    processed_data['api_message'] = f"Expiry date parse error: {str(exp_date_raw)[:30]}"
+
+
+        # Update status based on expiry if not already set to Inactive/Disabled
+        if processed_data['expiry_date_ts'] is not None:
+            if processed_data['expiry_date_ts'] < datetime.now(timezone.utc).timestamp():
+                processed_data['api_status'] = "Expired"
+            elif processed_data['api_status'] == "Info Retrieved": # Only if not explicitly inactive
+                 processed_data['api_status'] = "Active"
+        elif processed_data['api_status'] == "Info Retrieved": # No expiry, no explicit status
+            processed_data['api_status'] = "Unknown" # Or "Active (No Expiry)"
+
+        # Stalker portals usually don't provide trial, active_cons, max_cons in get_main_info
+        # These will remain None unless specific portals are found to provide them.
+        # is_trial, active_connections, max_connections remain as their defaults (None)
+
+        processed_data['success'] = True
+        if not processed_data.get('api_message') or processed_data['api_message'] == "Check init error (Stalker)":
+            processed_data['api_message'] = user_info.get('message', "Status successfully retrieved.") # Some portals might have a message field
+        if not processed_data['api_message'] and processed_data['success']:
+             processed_data['api_message'] = "OK"
+
+
+        return processed_data
+
+    except requests.exceptions.Timeout:
+        processed_data['api_message'] = f"Request Timeout ({API_TIMEOUT}s) (Stalker)"
+        logging.warning(f"Stalker: Timeout for MAC {formatted_mac} at {portal_url}")
+    except requests.exceptions.HTTPError as e:
+        processed_data['api_message'] = f"HTTP Error {e.response.status_code} (Stalker)"
+        if response_text: processed_data['raw_user_info'] = json.dumps({"error_context_response": response_text[:500]})
+        logging.warning(f"Stalker: HTTP Error {e.response.status_code} for MAC {formatted_mac} at {portal_url}. Response: {response_text[:200] if response_text else 'N/A'}")
+    except requests.exceptions.RequestException as e:
+        processed_data['api_message'] = f"Connection Error (Stalker): {type(e).__name__}"
+        logging.warning(f"Stalker: Connection Error for MAC {formatted_mac} at {portal_url}: {e}")
+    except json.JSONDecodeError:
+        processed_data['api_message'] = "Invalid JSON response (Stalker)"
+        if response_text: processed_data['raw_user_info'] = json.dumps({"non_json_response": response_text[:500]})
+        logging.warning(f"Stalker: JSON Decode Error for MAC {formatted_mac} at {portal_url}. Response: {response_text[:200] if response_text else 'N/A'}")
+    except Exception as e:
+        processed_data['api_message'] = f"Unexpected API Error (Stalker): {type(e).__name__}"
+        logging.exception(f"Stalker: Unexpected error during API check for MAC {formatted_mac} at {portal_url}.")
+
+    processed_data['success'] = False
+    return processed_data
+
+
 # =============================================================================
 # DIALOGS
 # =============================================================================
@@ -428,39 +637,173 @@ class EntryDialog(QDialog):
         super().__init__(parent); self.entry_id = entry_id; self.is_edit_mode = entry_id is not None
         self.setWindowTitle(f"{'Edit' if self.is_edit_mode else 'Add'} IPTV Entry"); self.setMinimumWidth(450); self.setWindowModality(Qt.WindowModal)
         layout = QVBoxLayout(self); form_layout = QFormLayout()
-        self.name_edit = QLineEdit(); self.category_combo = QComboBox(); self.server_url_edit = QLineEdit(); self.username_edit = QLineEdit()
-        self.password_edit = QLineEdit(); self.password_edit.setEchoMode(QLineEdit.Password); self.populate_categories()
-        form_layout.addRow("Display Name:", self.name_edit); form_layout.addRow("Category:", self.category_combo)
-        form_layout.addRow("Server URL (e.g., http://domain:port):", self.server_url_edit); form_layout.addRow("Username:", self.username_edit)
-        form_layout.addRow("Password:", self.password_edit); layout.addLayout(form_layout)
+
+        self.name_edit = QLineEdit()
+        self.category_combo = QComboBox()
+        self.populate_categories()
+
+        self.account_type_combo = QComboBox()
+        self.account_type_combo.addItems(["Xtream Codes API", "Stalker Portal"])
+        self.account_type_combo.currentTextChanged.connect(self.toggle_input_fields)
+
+        # XC API Fields
+        self.server_url_label = QLabel("Server URL (e.g., http://domain:port):")
+        self.server_url_edit = QLineEdit()
+        self.username_label = QLabel("Username:")
+        self.username_edit = QLineEdit()
+        self.password_label = QLabel("Password:")
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+
+        # Stalker Portal Fields
+        self.portal_url_label = QLabel("Portal URL (e.g., http://domain:port/c/):")
+        self.portal_url_edit = QLineEdit()
+        self.mac_address_label = QLabel("MAC Address (XX:XX:XX:XX:XX:XX):")
+        self.mac_address_edit = QLineEdit()
+
+        form_layout.addRow("Display Name:", self.name_edit)
+        form_layout.addRow("Category:", self.category_combo)
+        form_layout.addRow("Account Type:", self.account_type_combo)
+
+        # Add XC fields (will be shown/hidden)
+        form_layout.addRow(self.server_url_label, self.server_url_edit)
+        form_layout.addRow(self.username_label, self.username_edit)
+        form_layout.addRow(self.password_label, self.password_edit)
+
+        # Add Stalker fields (will be shown/hidden)
+        form_layout.addRow(self.portal_url_label, self.portal_url_edit)
+        form_layout.addRow(self.mac_address_label, self.mac_address_edit)
+
+        layout.addLayout(form_layout)
         self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.button_box.accepted.connect(self.accept_dialog); self.button_box.rejected.connect(self.reject); layout.addWidget(self.button_box)
-        if self.is_edit_mode: self.load_entry_data()
+        self.button_box.accepted.connect(self.accept_dialog)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+        if self.is_edit_mode:
+            self.load_entry_data()
+        else:
+            self.toggle_input_fields(self.account_type_combo.currentText()) # Initial field visibility
+
         self.name_edit.setFocus()
+
+    def toggle_input_fields(self, account_type_text):
+        is_stalker = account_type_text == "Stalker Portal"
+
+        # XC Fields
+        self.server_url_label.setVisible(not is_stalker)
+        self.server_url_edit.setVisible(not is_stalker)
+        self.username_label.setVisible(not is_stalker)
+        self.username_edit.setVisible(not is_stalker)
+        self.password_label.setVisible(not is_stalker)
+        self.password_edit.setVisible(not is_stalker)
+
+        # Stalker Fields
+        self.portal_url_label.setVisible(is_stalker)
+        self.portal_url_edit.setVisible(is_stalker)
+        self.mac_address_label.setVisible(is_stalker)
+        self.mac_address_edit.setVisible(is_stalker)
+
     def populate_categories(self):
         self.category_combo.clear();
         try: cats = get_all_categories(); self.category_combo.addItems(cats if cats else ["Uncategorized"])
         except Exception as e: logging.error(f"Failed to populate categories: {e}"); self.category_combo.addItem("Uncategorized")
+
     def load_entry_data(self):
         try:
             entry = get_entry_by_id(self.entry_id)
             if entry:
-                self.name_edit.setText(entry['name']); self.server_url_edit.setText(entry['server_base_url'])
-                self.username_edit.setText(entry['username']); self.password_edit.setText(entry['password'])
+                self.name_edit.setText(entry['name'])
+                current_account_type = entry.get('account_type', 'xc') # Default to 'xc' if not set
+                type_display_name = "Stalker Portal" if current_account_type == 'stalker' else "Xtream Codes API"
+                self.account_type_combo.setCurrentText(type_display_name)
+                self.toggle_input_fields(type_display_name) # Ensure fields are visible before setting text
+
+                if current_account_type == 'stalker':
+                    self.portal_url_edit.setText(entry['portal_url'] or "")
+                    self.mac_address_edit.setText(entry['mac_address'] or "")
+                    # Clear XC fields if they had data from a previous type
+                    self.server_url_edit.setText("")
+                    self.username_edit.setText("")
+                    self.password_edit.setText("")
+                else: # 'xc' or default
+                    self.server_url_edit.setText(entry['server_base_url'])
+                    self.username_edit.setText(entry['username'])
+                    self.password_edit.setText(entry['password'])
+                    # Clear Stalker fields
+                    self.portal_url_edit.setText("")
+                    self.mac_address_edit.setText("")
+
                 idx = self.category_combo.findText(entry['category'])
                 if idx != -1: self.category_combo.setCurrentIndex(idx)
                 else: self.category_combo.addItem(entry['category']); self.category_combo.setCurrentText(entry['category'])
             else: QMessageBox.warning(self, "Error", "Could not load entry data."); self.reject()
         except Exception as e: logging.error(f"Error loading entry ID {self.entry_id}: {e}"); QMessageBox.critical(self, "Load Error", f"Failed to load: {e}"); self.reject()
-    def get_data(self): return {"name": self.name_edit.text().strip(), "category": self.category_combo.currentText(), "server_url": self.server_url_edit.text().strip(), "username": self.username_edit.text().strip(), "password": self.password_edit.text()}
+
+    def get_data(self):
+        data = {
+            "name": self.name_edit.text().strip(),
+            "category": self.category_combo.currentText(),
+            "account_type_text": self.account_type_combo.currentText()
+        }
+        if data["account_type_text"] == "Stalker Portal":
+            data["account_type"] = "stalker"
+            data["portal_url"] = self.portal_url_edit.text().strip()
+            data["mac_address"] = self.mac_address_edit.text().strip().upper()
+            # For Stalker, server_base_url might be derived from portal_url or set to portal_url itself
+            # Let's use portal_url for server_base_url for now, can be refined.
+            # Username/password are not used for Stalker in this context
+            parsed_portal = urlparse(data["portal_url"])
+            data["server_url"] = f"{parsed_portal.scheme}://{parsed_portal.netloc}" if parsed_portal.scheme and parsed_portal.netloc else data["portal_url"]
+            data["username"] = "" # Not applicable
+            data["password"] = "" # Not applicable
+        else: # Xtream Codes API
+            data["account_type"] = "xc"
+            data["server_url"] = self.server_url_edit.text().strip()
+            data["username"] = self.username_edit.text().strip()
+            data["password"] = self.password_edit.text()
+            data["portal_url"] = None
+            data["mac_address"] = None
+        return data
+
     @Slot()
     def accept_dialog(self):
         data = self.get_data()
-        if not all([data['name'], data['server_url'], data['username'] is not None]): QMessageBox.warning(self, "Input Error", "Name, Server URL, and Username must be filled."); return
-        if not (data['server_url'].startswith("http://") or data['server_url'].startswith("https://")): QMessageBox.warning(self, "Input Error", "Server URL must start with http:// or https://."); return
+
+        # Common validation
+        if not data['name']:
+            QMessageBox.warning(self, "Input Error", "Display Name must be filled.")
+            return
+
+        if data['account_type'] == 'xc':
+            if not all([data['server_url'], data['username'] is not None]): # Password can be empty
+                QMessageBox.warning(self, "Input Error", "For Xtream Codes API, Name, Server URL, and Username must be filled.")
+                return
+            if not (data['server_url'].startswith("http://") or data['server_url'].startswith("https://")):
+                QMessageBox.warning(self, "Input Error", "Server URL must start with http:// or https://.")
+                return
+        elif data['account_type'] == 'stalker':
+            if not all([data['portal_url'], data['mac_address']]):
+                QMessageBox.warning(self, "Input Error", "For Stalker Portal, Portal URL and MAC Address must be filled.")
+                return
+            if not (data['portal_url'].startswith("http://") or data['portal_url'].startswith("https://")):
+                QMessageBox.warning(self, "Input Error", "Portal URL must start with http:// or https://.")
+                return
+
+            mac_pattern = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+            if not mac_pattern.match(data['mac_address']):
+                 QMessageBox.warning(self, "Input Error", "MAC Address must be in the format XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX.")
+                 return
+
         try:
-            if self.is_edit_mode: update_entry(self.entry_id, data['name'], data['category'], data['server_url'], data['username'], data['password'])
-            else: add_entry(data['name'], data['category'], data['server_url'], data['username'], data['password'])
+            if self.is_edit_mode:
+                update_entry(self.entry_id, data['name'], data['category'],
+                             data['server_url'], data['username'], data['password'],
+                             data['account_type'], data['mac_address'], data['portal_url'])
+            else:
+                add_entry(data['name'], data['category'],
+                          data['server_url'], data['username'], data['password'],
+                          data['account_type'], data['mac_address'], data['portal_url'])
             self.accept()
         except Exception as e: logging.error(f"Error saving entry: {e}"); QMessageBox.critical(self, "Database Error", f"Could not save: {e}")
 
@@ -660,13 +1003,27 @@ class ApiCheckerWorker(QObject):
                     self.progress_updated.emit(processed_count, total)
                     continue
 
-                # Actual API call
-                api_result = check_account_status_detailed_api(
-                    entry_data['server_base_url'],
-                    entry_data['username'],
-                    entry_data['password'],
-                    self._session
-                )
+                account_type = entry_data.get('account_type', 'xc') # Default to 'xc'
+                api_result = None
+
+                if account_type == 'stalker':
+                    logging.info(f"Worker: Checking Stalker Portal entry ID {entry_id} (MAC: {entry_data['mac_address']})")
+                    api_result = check_stalker_portal_status(
+                        entry_data['portal_url'], # Use the specific portal_url field
+                        entry_data['mac_address'],
+                        self._session
+                    )
+                else: # 'xc' or other unknown types default to XC API check
+                    if account_type != 'xc':
+                        logging.warning(f"Worker: Unknown account type '{account_type}' for entry ID {entry_id}. Defaulting to XC API check.")
+                    logging.info(f"Worker: Checking XC API entry ID {entry_id} (User: {entry_data['username']})")
+                    api_result = check_account_status_detailed_api(
+                        entry_data['server_base_url'],
+                        entry_data['username'],
+                        entry_data['password'],
+                        self._session
+                    )
+
                 self.result_ready.emit(entry_id, api_result)
                 processed_count += 1
                 if REQUEST_DELAY_BETWEEN_CHECKS > 0:
@@ -741,7 +1098,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
-COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "Username", "Message"]
+COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "User / MAC", "Message"]
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -948,8 +1305,16 @@ class MainWindow(QMainWindow):
                 if not dt_utc.isValid() : dt_utc = QDateTime.fromString(last_chk_raw, Qt.ISODateWithMs).toUTC()
                 dt_local = dt_utc.toLocalTime(); last_chk_disp = dt_local.toString("yyyy-MM-dd hh:mm")
             except Exception as e: logging.warning(f"Error parsing last_checked_at '{last_chk_raw}': {e}")
-        items.append(QStandardItem(last_chk_disp)); items.append(QStandardItem(entry_data['server_base_url']))
-        items.append(QStandardItem(entry_data['username']))
+        items.append(QStandardItem(last_chk_disp))
+
+        account_type = entry_data.get('account_type', 'xc')
+        if account_type == 'stalker':
+            items.append(QStandardItem(entry_data.get('portal_url', 'N/A'))) # Server column
+            items.append(QStandardItem(entry_data.get('mac_address', 'N/A'))) # Username column, now User/MAC
+        else: # XC
+            items.append(QStandardItem(entry_data['server_base_url']))
+            items.append(QStandardItem(entry_data['username']))
+
         api_msg = entry_data['api_message'] if entry_data['api_message'] is not None else ""
         items.append(QStandardItem(api_msg))
         return items

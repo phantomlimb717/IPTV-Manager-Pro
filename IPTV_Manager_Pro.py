@@ -455,12 +455,12 @@ def _get_stalker_token(session: requests.Session, portal_url: str, mac_address: 
     """Performs handshake and retrieves token for Stalker Portal."""
     handshake_url = f"{portal_url.rstrip('/')}/portal.php?action=handshake&type=stb&token=&JsHttpRequest=1-xml"
     headers = {**STALKER_COMMON_HEADERS, 'Authorization': f"MAC {mac_address}"}
-    # Stalker portals often expect the MAC as a cookie as well
-    session.cookies.update({"mac": mac_address.replace(":", "").lower()}) # Common format for cookie MAC
+    # Stalker portals often expect the MAC as a cookie as well.
+    # maclist.py seems to use the MAC with colons directly.
+    session.cookies.update({"mac": mac_address})
     session.headers.update({'Referer': f"{portal_url.rstrip('/')}/c/"})
 
-
-    logging.info(f"Stalker: Attempting handshake with {portal_url} for MAC {mac_address}")
+    logging.info(f"Stalker: Attempting handshake with {portal_url} for MAC {mac_address} (Cookie MAC: {mac_address})")
     try:
         response = session.get(handshake_url, headers=headers, timeout=API_TIMEOUT)
         response.raise_for_status()
@@ -550,43 +550,61 @@ def check_stalker_portal_status(portal_url: str, mac_address: str, session: requ
         exp_date_raw = user_info.get('exp_date') # Primary target
         if exp_date_raw is None:
             exp_date_raw = user_info.get('expire_date') # Secondary common target
-        if exp_date_raw is None:
-            exp_date_raw = user_info.get('phone') # Fallback from maclist.py example
+
+        source_of_date = "exp_date/expire_date"
+
+        if exp_date_raw is None and 'phone' in user_info: # Check 'phone' only if others failed
+            exp_date_raw = user_info.get('phone')
+            source_of_date = "phone"
+            logging.info(f"Stalker: Trying to parse expiry from 'phone' field for MAC {formatted_mac}: '{exp_date_raw}'")
+
 
         if exp_date_raw is not None:
             try:
                 # Attempt to parse as Unix timestamp first
                 exp_ts = int(float(exp_date_raw))
-                if exp_ts > 0 : processed_data['expiry_date_ts'] = exp_ts
+                if exp_ts > 0:
+                    processed_data['expiry_date_ts'] = exp_ts
+                    logging.info(f"Stalker: Parsed expiry for MAC {formatted_mac} as UNIX timestamp: {exp_ts} from '{source_of_date}' field.")
             except (ValueError, TypeError):
                 # Attempt to parse as string date
-                try:
-                    # Example: "2023-12-31 23:59:59" or "31.12.2023"
-                    # This needs more robust parsing if multiple formats are common.
-                    # For now, let's assume a common format if it's a string.
-                    # A simple check for now; real parsing might need dateutil.parser
-                    if isinstance(exp_date_raw, str):
-                        if ' ' in exp_date_raw and ':' in exp_date_raw: # Likely "YYYY-MM-DD HH:MM:SS"
+                if isinstance(exp_date_raw, str):
+                    dt_obj = None
+                    parsed_format_msg = ""
+                    try:
+                        # Try "Month Day, Year, HH:MM am/pm" format (e.g., "August 17, 2025, 12:00 am")
+                        dt_obj = datetime.strptime(exp_date_raw, '%B %d, %Y, %I:%M %p')
+                        parsed_format_msg = "%B %d, %Y, %I:%M %p"
+                    except ValueError:
+                        try:
+                            # Try "YYYY-MM-DD HH:MM:SS"
                             dt_obj = datetime.strptime(exp_date_raw, '%Y-%m-%d %H:%M:%S')
-                        elif '.' in exp_date_raw and len(exp_date_raw) == 10: # Likely "DD.MM.YYYY"
-                            dt_obj = datetime.strptime(exp_date_raw, '%d.%m.%Y')
-                        else: # Add more formats if needed
-                            dt_obj = None
+                            parsed_format_msg = "%Y-%m-%d %H:%M:%S"
+                        except ValueError:
+                            try:
+                                # Try "DD.MM.YYYY"
+                                dt_obj = datetime.strptime(exp_date_raw, '%d.%m.%Y')
+                                parsed_format_msg = "%d.%m.%Y"
+                            except ValueError:
+                                # Add more formats if needed
+                                pass # dt_obj remains None
 
-                        if dt_obj:
-                            processed_data['expiry_date_ts'] = int(dt_obj.replace(tzinfo=timezone.utc).timestamp())
-                        else:
-                            logging.warning(f"Stalker: Unparseable string exp_date '{exp_date_raw}' for MAC {formatted_mac}")
-                            processed_data['api_message'] = f"Expiry date format unknown: {str(exp_date_raw)[:30]}"
+                    if dt_obj:
+                        # Assume parsed naive datetime is in UTC as server times often are.
+                        # If it were local, timezone conversion would be needed if TZ known.
+                        processed_data['expiry_date_ts'] = int(dt_obj.replace(tzinfo=timezone.utc).timestamp())
+                        logging.info(f"Stalker: Parsed expiry for MAC {formatted_mac} from string '{exp_date_raw}' (format '{parsed_format_msg}') to TS: {processed_data['expiry_date_ts']} from '{source_of_date}' field.")
+                        if source_of_date == "phone" and (not processed_data['api_message'] or processed_data['api_message'] == "Check init error (Stalker)"):
+                             processed_data['api_message'] = f"Expiry from 'phone': {exp_date_raw}"
+
                     else:
-                        logging.warning(f"Stalker: Invalid exp_date format '{exp_date_raw}' for MAC {formatted_mac}")
+                        logging.warning(f"Stalker: Unparseable string exp_date '{exp_date_raw}' for MAC {formatted_mac} from '{source_of_date}'.")
+                        if not processed_data['api_message'] or processed_data['api_message'] == "Check init error (Stalker)" or "format unknown" not in processed_data['api_message'] :
+                             processed_data['api_message'] = f"Expiry date format unknown: {str(exp_date_raw)[:30]}"
+                else:
+                    logging.warning(f"Stalker: Invalid (non-string, non-numeric) exp_date format '{exp_date_raw}' for MAC {formatted_mac} from '{source_of_date}'.")
 
-                except (ValueError, TypeError) as date_parse_err:
-                    logging.warning(f"Stalker: Error parsing exp_date string '{exp_date_raw}' for MAC {formatted_mac}: {date_parse_err}")
-                    processed_data['api_message'] = f"Expiry date parse error: {str(exp_date_raw)[:30]}"
-
-
-        # Update status based on expiry if not already set to Inactive/Disabled
+        # Update status based on expiry
         if processed_data['expiry_date_ts'] is not None:
             if processed_data['expiry_date_ts'] < datetime.now(timezone.utc).timestamp():
                 processed_data['api_status'] = "Expired"
@@ -1458,9 +1476,16 @@ class MainWindow(QMainWindow):
         if not entry_id_item: return None
 
         entry_id = entry_id_item.data(Qt.UserRole)
-        entry = get_entry_by_id(entry_id)
+        entry = get_entry_by_id(entry_id) # entry is an sqlite3.Row
         if entry:
-            return f"{entry['server_base_url']}/get.php?username={entry['username']}&password={entry['password']}&type=m3u_plus&output=ts"
+            account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
+            if account_type == 'stalker':
+                # For Stalker, a direct M3U link isn't applicable in the same way.
+                # Returning the portal URL might be the most "link-like" useful info.
+                # Or return None and let the caller handle it.
+                return None # Signifies not applicable
+            else: # XC
+                return f"{entry['server_base_url']}/get.php?username={entry['username']}&password={entry['password']}&type=m3u_plus&output=ts"
         return None
 
     @Slot()
@@ -1469,9 +1494,18 @@ class MainWindow(QMainWindow):
         m3u_link = self.get_entry_data_for_export(current_proxy_index)
         if m3u_link:
             QGuiApplication.clipboard().setText(m3u_link)
-            self.status_bar.showMessage("M3U link copied to clipboard.", 3000)
+            self.status_bar.showMessage("M3U link copied to clipboard (XC API only).", 3000)
         else:
-            QMessageBox.warning(self, "Export Error", "Could not get data for the current entry.")
+            # Check if it's a Stalker entry or genuinely failed to get data for XC
+            source_index = self.proxy_model.mapToSource(current_proxy_index)
+            entry_id_item = self.table_model.itemFromIndex(source_index.siblingAtColumn(COL_ID))
+            if entry_id_item:
+                entry_id = entry_id_item.data(Qt.UserRole)
+                db_entry = get_entry_by_id(entry_id)
+                if db_entry and (db_entry['account_type'] if db_entry['account_type'] is not None else 'xc') == 'stalker':
+                    QMessageBox.information(self, "Copy Link", "Direct M3U link generation is not applicable for Stalker Portal entries.")
+                    return
+            QMessageBox.warning(self, "Export Error", "Could not get M3U link for the current entry.")
 
     @Slot()
     def export_selected_to_txt(self):

@@ -185,6 +185,15 @@ def update_entry(entry_id, name, category, server_url, username, password, accou
         logging.info(f"Updated entry ID: {entry_id} (Type: {account_type})")
     finally: conn.close()
 
+def update_entry_category(entry_id, category):
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE entries SET category = ? WHERE id = ?", (category, entry_id))
+        conn.commit()
+        logging.info(f"Updated category for entry ID: {entry_id} to {category}")
+    finally:
+        conn.close()
+
 def delete_entry(entry_id):
     conn = get_db_connection()
     try:
@@ -949,6 +958,42 @@ class BatchImportOptionsDialog(QDialog):
         except Exception as e: logging.error(f"BatchImportOptionsDialog: Failed to populate categories: {e}"); self.category_combo.addItem("Uncategorized")
     def get_selected_category(self): return self.category_combo.currentText()
 
+class BulkEditCategoryDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk Edit Category")
+        self.setMinimumWidth(350)
+        self.setWindowModality(Qt.WindowModal)
+
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+
+        self.category_combo = QComboBox()
+        self.populate_categories()
+
+        form_layout.addRow("Assign to Category:", self.category_combo)
+        layout.addLayout(form_layout)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def populate_categories(self):
+        self.category_combo.clear()
+        try:
+            cats = get_all_categories()
+            self.category_combo.addItems(cats if cats else ["Uncategorized"])
+            uncat_idx = self.category_combo.findText("Uncategorized")
+            if uncat_idx != -1:
+                self.category_combo.setCurrentIndex(uncat_idx)
+        except Exception as e:
+            logging.error(f"BulkEditCategoryDialog: Failed to populate categories: {e}")
+            self.category_combo.addItem("Uncategorized")
+
+    def get_selected_category(self):
+        return self.category_combo.currentText()
+
 
 # =============================================================================
 # API CHECKER WORKER
@@ -1179,12 +1224,14 @@ class MainWindow(QMainWindow):
         self.add_button = QPushButton("Add Entry")
         self.edit_button = QPushButton("Edit Selected")
         self.delete_button = QPushButton("Delete Selected")
+        self.bulk_edit_button = QPushButton("Bulk Edit")
         self.import_url_button = QPushButton("Import URL")
         self.import_file_button = QPushButton("Import File")
 
         top_controls_layout.addWidget(self.add_button)
         top_controls_layout.addWidget(self.edit_button)
         top_controls_layout.addWidget(self.delete_button)
+        top_controls_layout.addWidget(self.bulk_edit_button)
         top_controls_layout.addSpacing(10)
         top_controls_layout.addWidget(self.import_url_button)
         top_controls_layout.addWidget(self.import_file_button)
@@ -1266,6 +1313,7 @@ class MainWindow(QMainWindow):
         self.add_button.clicked.connect(self.add_entry_action)
         self.edit_button.clicked.connect(self.edit_entry_action)
         self.delete_button.clicked.connect(self.delete_entry_action)
+        self.bulk_edit_button.clicked.connect(self.bulk_edit_category_action)
         self.import_url_button.clicked.connect(self.import_from_url_action)
         self.import_file_button.clicked.connect(self.import_from_file_action)
         self.manage_categories_button.clicked.connect(self.manage_categories_action)
@@ -1378,6 +1426,7 @@ class MainWindow(QMainWindow):
 
         self.edit_button.setEnabled(selected_row_count == 1 and can_interact)
         self.delete_button.setEnabled(has_selection and can_interact)
+        self.bulk_edit_button.setEnabled(has_selection and can_interact)
         self.check_selected_button.setEnabled(has_selection and can_interact)
         self.export_txt_button.setEnabled(has_selection and can_interact)
 
@@ -1417,6 +1466,25 @@ class MainWindow(QMainWindow):
 
         diag = EntryDialog(entry_id=entry_id, parent=self)
         if diag.exec(): self.refresh_row_by_id(entry_id); self.update_category_filter_combo()
+
+    @Slot()
+    def bulk_edit_category_action(self):
+        selected_ids = self.get_selected_entry_ids()
+        if not selected_ids:
+            QMessageBox.information(self, "Bulk Edit", "No entries selected.")
+            return
+
+        dialog = BulkEditCategoryDialog(parent=self)
+        if dialog.exec():
+            new_category = dialog.get_selected_category()
+            try:
+                for entry_id in selected_ids:
+                    update_entry_category(entry_id, new_category)
+                self.load_entries_to_table()
+                QMessageBox.information(self, "Success", f"{len(selected_ids)} entries have been moved to the '{new_category}' category.")
+            except Exception as e:
+                logging.error(f"Error bulk updating categories: {e}")
+                QMessageBox.critical(self, "Database Error", f"Could not update categories: {e}")
 
     @Slot()
     def delete_entry_action(self):

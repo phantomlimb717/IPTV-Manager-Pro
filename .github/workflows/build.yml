@@ -1,6 +1,18 @@
+name: Build IPTV Manager Pro
+
+# This 'on' block is correctly formatted and includes your original triggers
+# plus workflow_dispatch for manual runs.
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 0 */10 * *'
+  workflow_dispatch:
+
 jobs:
   build-macos:
-    runs-on: macos-12 # Using a specific version for stability
+    runs-on: macos-12 # Using a specific version for build stability
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -16,66 +28,52 @@ jobs:
           pip install -r requirements.txt
 
       - name: Create macOS Runtime Hook
+        id: create_hook
         run: |
+          # This step creates the special macOS-only hook file
           cat <<'EOF' > macos_runtime_hook.py
           import sys
           import os
           import shutil
           from pathlib import Path
 
-          # This hook's logic only runs on macOS when the app is bundled.
           if sys.platform == 'darwin' and hasattr(sys, '_MEIPASS'):
-              print("macOS PyInstaller Hook: Setting up user-writable paths...")
-              
-              # Define the standard user data location on macOS
               APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "IPTV Manager Pro"
               APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
-
-              # Define the final paths for the data files
+              
               writable_db_path = APP_SUPPORT_DIR / 'iptv_store.db'
               writable_settings_path = APP_SUPPORT_DIR / 'settings.json'
               writable_log_path = APP_SUPPORT_DIR / 'iptv_manager_log.txt'
 
-              # Find the template files that PyInstaller bundled with the app
               bundled_db_path = os.path.join(sys._MEIPASS, 'iptv_store.db')
-              bundled_settings_path = os.path.join(sys._MEIPASS, 'settings.json')
-
-              # If the user doesn't have a database yet, copy the template from our bundle
               if not os.path.exists(writable_db_path) and os.path.exists(bundled_db_path):
-                  print(f"Copying database to {writable_db_path}")
                   shutil.copy2(bundled_db_path, writable_db_path)
               
-              # Do the same for the settings file
+              bundled_settings_path = os.path.join(sys._MEIPASS, 'settings.json')
               if not os.path.exists(writable_settings_path):
                   if os.path.exists(bundled_settings_path):
-                      print(f"Copying settings to {writable_settings_path}")
                       shutil.copy2(bundled_settings_path, writable_settings_path)
                   else:
-                      # If no settings file was bundled, create a default one
                       with open(writable_settings_path, 'w') as f:
                           import json
                           json.dump({"theme": "light"}, f, indent=4)
               
-              # --- THE MAGIC ---
-              # We now "monkey-patch" the global variables in your main script
-              # *before* your code runs. Your script will now use these new, correct paths.
+              # Monkey-patch the global variables in your main script
               import IPTV_Manager_Pro
               IPTV_Manager_Pro.DATABASE_NAME = str(writable_db_path)
               IPTV_Manager_Pro.SETTINGS_FILE = str(writable_settings_path)
               IPTV_Manager_Pro.LOG_FILE = str(writable_log_path)
-              print("macOS PyInstaller Hook: Paths have been updated successfully.")
           EOF
 
       - name: Run PyInstaller for macOS
         run: |
+          # This command now bundles all necessary files and the hook
           pyinstaller --windowed \
             --noconfirm \
             --name "IPTV Manager Pro" \
             --target-arch=universal2 \
-            --icon="icon.icns" \
             --add-data="iptv_store.db:." \
             --add-data="settings.json:." \
-            --add-data="icon.icns:." \
             --runtime-hook="macos_runtime_hook.py" \
             IPTV_Manager_Pro.py
 

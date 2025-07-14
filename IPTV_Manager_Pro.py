@@ -61,7 +61,7 @@ APP_VERSION = "0.2.4" # Incremented version for new features
 DATABASE_NAME = 'iptv_store.db'
 LOG_FILE = 'iptv_manager_log.txt'
 USER_AGENT = f'{APP_NAME}/{APP_VERSION} (okhttp/3.12.1)'
-API_TIMEOUT = 15
+API_TIMEOUT = 5
 REQUEST_DELAY_BETWEEN_CHECKS = 0.2
 SETTINGS_FILE = "settings.json"
 

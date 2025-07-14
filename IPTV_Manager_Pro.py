@@ -1182,7 +1182,7 @@ class MainWindow(QMainWindow):
         self.load_settings() # Load settings on startup
         # *** MODIFIED LINE ***
         # Use the resource_path helper to find the icon, both in development and in the PyInstaller bundle.
-        self.setWindowIcon(QIcon(resource_path("icon.ico")))
+        self.setWindowIcon(QIcon(resource_path("icon.icns" if sys.platform == "darwin" else "icon.ico")))
 
     def setup_ui(self):
         menubar = self.menuBar()

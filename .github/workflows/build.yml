@@ -25,7 +25,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run PyInstaller
-        run: pyinstaller --onedir --windowed --target-arch=universal2 IPTV_Manager_Pro.py
+        run: pyinstaller --windowed --target-arch=universal2 IPTV_Manager_Pro.py
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

@@ -72,8 +72,6 @@ jobs:
             --noconfirm \
             --name "IPTV Manager Pro" \
             --target-arch=universal2 \
-            --add-data="iptv_store.db:." \
-            --add-data="settings.json:." \
             --runtime-hook="macos_runtime_hook.py" \
             IPTV_Manager_Pro.py
 

@@ -1,0 +1,59 @@
+name: Build IPTV Manager Pro
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 0 */10 * *'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run PyInstaller
+        run: pyinstaller --onefile --windowed --icon=icon.ico IPTV_Manager_Pro.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: IPTV-Manager-Pro-Windows
+          path: dist/IPTV_Manager_Pro.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run PyInstaller
+        run: pyinstaller --onefile --windowed --icon=icon.ico IPTV_Manager_Pro.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: IPTV-Manager-Pro-macOS
+          path: dist/IPTV_Manager_Pro

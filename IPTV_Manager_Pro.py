@@ -349,10 +349,10 @@ def format_trial_status_display(is_trial):
     if is_trial is None: return "N/A"
     return "Yes" if str(is_trial) == '1' else "No"
 
-def get_category_counts(server_base_url, username, password, session):
+def get_stream_counts(server_base_url, username, password, session):
     counts = {'live': None, 'movie': None, 'series': None}
-    for cat_type in counts.keys():
-        action = f"get_{cat_type}_categories"
+    action_map = {'live': 'get_live_streams', 'movie': 'get_vod_streams', 'series': 'get_series'}
+    for cat_type, action in action_map.items():
         api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action={action}"
         try:
             response = session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
@@ -361,7 +361,7 @@ def get_category_counts(server_base_url, username, password, session):
             if isinstance(data, list):
                 counts[cat_type] = len(data)
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-            logging.warning(f"Could not fetch {cat_type} categories: {e}")
+            logging.warning(f"Could not fetch {cat_type} streams: {e}")
     return counts
 
 def check_account_status_detailed_api(server_base_url, username, password, session):
@@ -467,10 +467,10 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
             processed_data['api_message'] = "Valid connection but key data missing from API."
 
         if processed_data['success']:
-            category_counts = get_category_counts(server_base_url, username, password, session)
-            processed_data['live_streams_count'] = category_counts.get('live')
-            processed_data['movies_count'] = category_counts.get('movie')
-            processed_data['series_count'] = category_counts.get('series')
+            stream_counts = get_stream_counts(server_base_url, username, password, session)
+            processed_data['live_streams_count'] = stream_counts.get('live')
+            processed_data['movies_count'] = stream_counts.get('movie')
+            processed_data['series_count'] = stream_counts.get('series')
 
         return processed_data
 

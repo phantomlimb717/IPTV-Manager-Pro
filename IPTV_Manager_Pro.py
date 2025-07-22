@@ -1265,6 +1265,7 @@ class MainWindow(QMainWindow):
         self.add_button = QPushButton("Add Entry")
         self.edit_button = QPushButton("Edit Selected")
         self.delete_button = QPushButton("Delete Selected")
+        self.delete_duplicates_button = QPushButton("Delete Duplicates")
         self.bulk_edit_button = QPushButton("Bulk Edit")
         self.import_url_button = QPushButton("Import URL")
         self.import_file_button = QPushButton("Import File")
@@ -1272,6 +1273,7 @@ class MainWindow(QMainWindow):
         top_controls_layout.addWidget(self.add_button)
         top_controls_layout.addWidget(self.edit_button)
         top_controls_layout.addWidget(self.delete_button)
+        top_controls_layout.addWidget(self.delete_duplicates_button)
         top_controls_layout.addWidget(self.bulk_edit_button)
         top_controls_layout.addSpacing(10)
         top_controls_layout.addWidget(self.import_url_button)
@@ -1357,6 +1359,7 @@ class MainWindow(QMainWindow):
         self.add_button.clicked.connect(self.add_entry_action)
         self.edit_button.clicked.connect(self.edit_entry_action)
         self.delete_button.clicked.connect(self.delete_entry_action)
+        self.delete_duplicates_button.clicked.connect(self.delete_duplicates_action)
         self.bulk_edit_button.clicked.connect(self.bulk_edit_category_action)
         self.import_url_button.clicked.connect(self.import_from_url_action)
         self.import_file_button.clicked.connect(self.import_from_file_action)
@@ -1548,6 +1551,92 @@ class MainWindow(QMainWindow):
             for entry_id in ids_del:
                 try: delete_entry(entry_id)
                 except Exception as e: QMessageBox.warning(self, "Delete Error", f"Could not delete ID {entry_id}: {e}")
+            self.load_entries_to_table()
+
+    @Slot()
+    def delete_duplicates_action(self):
+        try:
+            all_entries = get_all_entries()
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", f"Could not retrieve entries to check for duplicates: {e}")
+            return
+
+        xtream_map = {}
+        stalker_map = {}
+        duplicates_to_delete = set()
+
+        for entry in all_entries:
+            entry_id = entry['id']
+            account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
+
+            if account_type == 'xc':
+                key = (entry['server_base_url'], entry['username'], entry['password'])
+                if key in xtream_map:
+                    existing_id, existing_last_checked = xtream_map[key]
+                    current_last_checked = entry['last_checked_at']
+
+                    if existing_last_checked is None and current_last_checked is None:
+                        # If both are None, keep the one with the lower ID
+                        if entry_id > existing_id:
+                            duplicates_to_delete.add(entry_id)
+                        else:
+                            duplicates_to_delete.add(existing_id)
+                            xtream_map[key] = (entry_id, current_last_checked)
+                    elif current_last_checked is None:
+                        duplicates_to_delete.add(entry_id)
+                    elif existing_last_checked is None:
+                        duplicates_to_delete.add(existing_id)
+                        xtream_map[key] = (entry_id, current_last_checked)
+                    elif current_last_checked > existing_last_checked:
+                        duplicates_to_delete.add(existing_id)
+                        xtream_map[key] = (entry_id, current_last_checked)
+                    else:
+                        duplicates_to_delete.add(entry_id)
+                else:
+                    xtream_map[key] = (entry_id, entry['last_checked_at'])
+            elif account_type == 'stalker':
+                key = (entry['portal_url'], entry['mac_address'])
+                if key in stalker_map:
+                    existing_id, existing_last_checked = stalker_map[key]
+                    current_last_checked = entry['last_checked_at']
+
+                    if existing_last_checked is None and current_last_checked is None:
+                        if entry_id > existing_id:
+                            duplicates_to_delete.add(entry_id)
+                        else:
+                            duplicates_to_delete.add(existing_id)
+                            stalker_map[key] = (entry_id, current_last_checked)
+                    elif current_last_checked is None:
+                        duplicates_to_delete.add(entry_id)
+                    elif existing_last_checked is None:
+                        duplicates_to_delete.add(existing_id)
+                        stalker_map[key] = (entry_id, current_last_checked)
+                    elif current_last_checked > existing_last_checked:
+                        duplicates_to_delete.add(existing_id)
+                        stalker_map[key] = (entry_id, current_last_checked)
+                    else:
+                        duplicates_to_delete.add(entry_id)
+                else:
+                    stalker_map[key] = (entry_id, entry['last_checked_at'])
+
+        if not duplicates_to_delete:
+            QMessageBox.information(self, "No Duplicates Found", "No duplicate entries were found.")
+            return
+
+        reply = QMessageBox.question(self, "Confirm Deletion",
+                                     f"Found {len(duplicates_to_delete)} duplicate entries. Do you want to delete them?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            deleted_count = 0
+            for entry_id in duplicates_to_delete:
+                try:
+                    delete_entry(entry_id)
+                    deleted_count += 1
+                except Exception as e:
+                    logging.error(f"Could not delete duplicate entry with ID {entry_id}: {e}")
+
+            QMessageBox.information(self, "Deletion Complete", f"Successfully deleted {deleted_count} duplicate entries.")
             self.load_entries_to_table()
 
     @Slot()

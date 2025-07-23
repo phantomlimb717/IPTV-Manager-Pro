@@ -142,6 +142,23 @@ def initialize_database():
             logging.info("Adding 'portal_url' column to entries table.")
             cursor.execute("ALTER TABLE entries ADD COLUMN portal_url TEXT")
 
+        # Add columns for category counts
+        try:
+            cursor.execute("SELECT live_streams_count FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'live_streams_count' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN live_streams_count INTEGER")
+        try:
+            cursor.execute("SELECT movies_count FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'movies_count' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN movies_count INTEGER")
+        try:
+            cursor.execute("SELECT series_count FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'series_count' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN series_count INTEGER")
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,14 +247,16 @@ def update_entry_status(entry_id, status_data):
             UPDATE entries
             SET last_checked_at = ?, api_status = ?, api_message = ?,
                 expiry_date_ts = ?, is_trial = ?, active_connections = ?,
-                max_connections = ?, raw_user_info = ?, raw_server_info = ?
+                max_connections = ?, raw_user_info = ?, raw_server_info = ?,
+                live_streams_count = ?, movies_count = ?, series_count = ?
             WHERE id = ?
         ''', (
             current_time_iso, status_data.get('api_status'), status_data.get('api_message'),
             status_data.get('expiry_date_ts'), status_data.get('is_trial'),
             status_data.get('active_connections'), status_data.get('max_connections'),
             status_data.get('raw_user_info'), status_data.get('raw_server_info'),
-            entry_id
+            status_data.get('live_streams_count'), status_data.get('movies_count'),
+            status_data.get('series_count'), entry_id
         ))
         conn.commit()
         logging.info(f"Updated status for entry ID: {entry_id} to {status_data.get('api_status')}")
@@ -330,11 +349,27 @@ def format_trial_status_display(is_trial):
     if is_trial is None: return "N/A"
     return "Yes" if str(is_trial) == '1' else "No"
 
+def get_stream_counts(server_base_url, username, password, session):
+    counts = {'live': None, 'movie': None, 'series': None}
+    action_map = {'live': 'get_live_streams', 'movie': 'get_vod_streams', 'series': 'get_series'}
+    for cat_type, action in action_map.items():
+        api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action={action}"
+        try:
+            response = session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, list):
+                counts[cat_type] = len(data)
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+            logging.warning(f"Could not fetch {cat_type} streams: {e}")
+    return counts
+
 def check_account_status_detailed_api(server_base_url, username, password, session):
     processed_data = {
         'success': False, 'api_status': None, 'api_message': "Check init error",
         'expiry_date_ts': None, 'is_trial': None, 'active_connections': None,
-        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None
+        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None,
+        'live_streams_count': None, 'movies_count': None, 'series_count': None
     }
     # Session should be initialized before this is called in a loop.
     if not all([server_base_url, username is not None, session]):
@@ -430,6 +465,12 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
 
         if processed_data['success'] and processed_data['api_status'] in [None, 'Unknown'] and not processed_data['api_message']:
             processed_data['api_message'] = "Valid connection but key data missing from API."
+
+        if processed_data['success']:
+            stream_counts = get_stream_counts(server_base_url, username, password, session)
+            processed_data['live_streams_count'] = stream_counts.get('live')
+            processed_data['movies_count'] = stream_counts.get('movie')
+            processed_data['series_count'] = stream_counts.get('series')
 
         return processed_data
 
@@ -1120,8 +1161,8 @@ class ApiCheckerWorker(QObject):
 # =============================================================================
 # CUSTOM PROXY MODEL FOR FILTERING
 # =============================================================================
-COL_ID, COL_NAME, COL_CATEGORY, COL_STATUS, COL_EXPIRY, COL_TRIAL, \
-COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_MSG = range(12)
+COL_ID, COL_NAME, COL_CATEGORY, COL_STATUS, COL_CHANNELS, COL_MOVIES, COL_SERIES, COL_EXPIRY, COL_TRIAL, \
+COL_ACTIVE_CONN, COL_MAX_CONN, COL_LAST_CHECKED, COL_SERVER, COL_USER, COL_MSG = range(15)
 
 class EntryFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
@@ -1164,7 +1205,7 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
-COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "User / MAC", "Message"]
+COLUMN_HEADERS = ["ID", "Name", "Category", "API Status", "Channels", "Movies", "Series", "Expires", "Trial?", "Active", "Max", "Last Checked", "Server", "User / MAC", "Message"]
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1224,6 +1265,7 @@ class MainWindow(QMainWindow):
         self.add_button = QPushButton("Add Entry")
         self.edit_button = QPushButton("Edit Selected")
         self.delete_button = QPushButton("Delete Selected")
+        self.delete_duplicates_button = QPushButton("Delete Duplicates")
         self.bulk_edit_button = QPushButton("Bulk Edit")
         self.import_url_button = QPushButton("Import URL")
         self.import_file_button = QPushButton("Import File")
@@ -1231,6 +1273,7 @@ class MainWindow(QMainWindow):
         top_controls_layout.addWidget(self.add_button)
         top_controls_layout.addWidget(self.edit_button)
         top_controls_layout.addWidget(self.delete_button)
+        top_controls_layout.addWidget(self.delete_duplicates_button)
         top_controls_layout.addWidget(self.bulk_edit_button)
         top_controls_layout.addSpacing(10)
         top_controls_layout.addWidget(self.import_url_button)
@@ -1292,6 +1335,9 @@ class MainWindow(QMainWindow):
         self.table_view.setColumnWidth(COL_NAME, 200)
         header.setSectionResizeMode(COL_CATEGORY, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_CHANNELS, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_MOVIES, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(COL_SERIES, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_EXPIRY, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_TRIAL, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_ACTIVE_CONN, QHeaderView.ResizeToContents)
@@ -1313,6 +1359,7 @@ class MainWindow(QMainWindow):
         self.add_button.clicked.connect(self.add_entry_action)
         self.edit_button.clicked.connect(self.edit_entry_action)
         self.delete_button.clicked.connect(self.delete_entry_action)
+        self.delete_duplicates_button.clicked.connect(self.delete_duplicates_action)
         self.bulk_edit_button.clicked.connect(self.bulk_edit_category_action)
         self.import_url_button.clicked.connect(self.import_from_url_action)
         self.import_file_button.clicked.connect(self.import_from_file_action)
@@ -1363,6 +1410,9 @@ class MainWindow(QMainWindow):
         items.append(QStandardItem(entry_data['name'])); items.append(QStandardItem(entry_data['category']))
         status_val = entry_data['api_status'] if entry_data['api_status'] is not None else "Not Checked"
         status_item = QStandardItem(status_val); self.apply_status_coloring(status_item, status_val); items.append(status_item)
+        items.append(QStandardItem(str(entry_data['live_streams_count']) if entry_data['live_streams_count'] is not None else "N/A"))
+        items.append(QStandardItem(str(entry_data['movies_count']) if entry_data['movies_count'] is not None else "N/A"))
+        items.append(QStandardItem(str(entry_data['series_count']) if entry_data['series_count'] is not None else "N/A"))
         items.append(QStandardItem(format_timestamp_display(entry_data['expiry_date_ts'])))
         items.append(QStandardItem(format_trial_status_display(entry_data['is_trial'])))
         active_c = entry_data['active_connections']; items.append(QStandardItem(str(active_c) if active_c is not None else "N/A"))
@@ -1501,6 +1551,92 @@ class MainWindow(QMainWindow):
             for entry_id in ids_del:
                 try: delete_entry(entry_id)
                 except Exception as e: QMessageBox.warning(self, "Delete Error", f"Could not delete ID {entry_id}: {e}")
+            self.load_entries_to_table()
+
+    @Slot()
+    def delete_duplicates_action(self):
+        try:
+            all_entries = get_all_entries()
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", f"Could not retrieve entries to check for duplicates: {e}")
+            return
+
+        xtream_map = {}
+        stalker_map = {}
+        duplicates_to_delete = set()
+
+        for entry in all_entries:
+            entry_id = entry['id']
+            account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
+
+            if account_type == 'xc':
+                key = (entry['server_base_url'], entry['username'], entry['password'])
+                if key in xtream_map:
+                    existing_id, existing_last_checked = xtream_map[key]
+                    current_last_checked = entry['last_checked_at']
+
+                    if existing_last_checked is None and current_last_checked is None:
+                        # If both are None, keep the one with the lower ID
+                        if entry_id > existing_id:
+                            duplicates_to_delete.add(entry_id)
+                        else:
+                            duplicates_to_delete.add(existing_id)
+                            xtream_map[key] = (entry_id, current_last_checked)
+                    elif current_last_checked is None:
+                        duplicates_to_delete.add(entry_id)
+                    elif existing_last_checked is None:
+                        duplicates_to_delete.add(existing_id)
+                        xtream_map[key] = (entry_id, current_last_checked)
+                    elif current_last_checked > existing_last_checked:
+                        duplicates_to_delete.add(existing_id)
+                        xtream_map[key] = (entry_id, current_last_checked)
+                    else:
+                        duplicates_to_delete.add(entry_id)
+                else:
+                    xtream_map[key] = (entry_id, entry['last_checked_at'])
+            elif account_type == 'stalker':
+                key = (entry['portal_url'], entry['mac_address'])
+                if key in stalker_map:
+                    existing_id, existing_last_checked = stalker_map[key]
+                    current_last_checked = entry['last_checked_at']
+
+                    if existing_last_checked is None and current_last_checked is None:
+                        if entry_id > existing_id:
+                            duplicates_to_delete.add(entry_id)
+                        else:
+                            duplicates_to_delete.add(existing_id)
+                            stalker_map[key] = (entry_id, current_last_checked)
+                    elif current_last_checked is None:
+                        duplicates_to_delete.add(entry_id)
+                    elif existing_last_checked is None:
+                        duplicates_to_delete.add(existing_id)
+                        stalker_map[key] = (entry_id, current_last_checked)
+                    elif current_last_checked > existing_last_checked:
+                        duplicates_to_delete.add(existing_id)
+                        stalker_map[key] = (entry_id, current_last_checked)
+                    else:
+                        duplicates_to_delete.add(entry_id)
+                else:
+                    stalker_map[key] = (entry_id, entry['last_checked_at'])
+
+        if not duplicates_to_delete:
+            QMessageBox.information(self, "No Duplicates Found", "No duplicate entries were found.")
+            return
+
+        reply = QMessageBox.question(self, "Confirm Deletion",
+                                     f"Found {len(duplicates_to_delete)} duplicate entries. Do you want to delete them?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            deleted_count = 0
+            for entry_id in duplicates_to_delete:
+                try:
+                    delete_entry(entry_id)
+                    deleted_count += 1
+                except Exception as e:
+                    logging.error(f"Could not delete duplicate entry with ID {entry_id}: {e}")
+
+            QMessageBox.information(self, "Deletion Complete", f"Successfully deleted {deleted_count} duplicate entries.")
             self.load_entries_to_table()
 
     @Slot()

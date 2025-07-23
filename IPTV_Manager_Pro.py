@@ -57,7 +57,7 @@ def resource_path(relative_path):
 
 # --- Configuration ---
 APP_NAME = "IPTV Manager Pro"
-APP_VERSION = "0.2.4" # Incremented version for new features
+APP_VERSION = "0.3" # Incremented version for new features
 DATABASE_NAME = 'iptv_store.db'
 LOG_FILE = 'iptv_manager_log.txt'
 USER_AGENT = f'{APP_NAME}/{APP_VERSION} (okhttp/3.12.1)'

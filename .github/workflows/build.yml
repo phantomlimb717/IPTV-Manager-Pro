@@ -24,7 +24,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run PyInstaller
-        run: pyinstaller --onefile --windowed --icon=icon.ico IPTV_Manager_Pro.py
+        run: pyinstaller --onefile --windowed --icon=icon.ico --add-data "icon.ico;." IPTV_Manager_Pro.py
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

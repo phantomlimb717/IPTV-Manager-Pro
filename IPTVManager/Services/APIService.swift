@@ -82,28 +82,80 @@ final class APIService: APIServiceProtocol {
 
         logger.debug("Requesting XC URL: \(url.absoluteString)")
 
-        let request = URLRequest(url: url)
-        let (data, response) = try await session.data(for: request)
+        // Concurrently fetch user info and stream counts
+        async let (data, response) = session.data(for: URLRequest(url: url))
+        async let streamCounts = fetchStreamCounts(for: entry, serverURL: serverURL, username: username, password: password)
 
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        // Await the results
+        let (awaitedData, awaitedResponse) = try await (data, response)
+
+        guard let httpResponse = awaitedResponse as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let statusCode = (awaitedResponse as? HTTPURLResponse)?.statusCode ?? -1
             logger.error("Received non-200 response: \(statusCode)")
             throw APIError.serverError(statusCode: statusCode)
         }
 
         do {
-            let apiResponse = try JSONDecoder().decode(XCAPIResponse.self, from: data)
-            return try mapXCResponseToAPIResult(response: apiResponse, rawData: data)
+            let apiResponse = try JSONDecoder().decode(XCAPIResponse.self, from: awaitedData)
+            let counts = await streamCounts // Await the counts result
+            return try mapXCResponseToAPIResult(response: apiResponse, streamCounts: counts, rawData: awaitedData)
         } catch {
             logger.error("XC JSON Decoding Error: \(error.localizedDescription)")
-            if let responseString = String(data: data, encoding: .utf8) {
+            if let responseString = String(data: awaitedData, encoding: .utf8) {
                  logger.error("Raw XC response: \(responseString)")
             }
             throw APIError.decodingError(error)
         }
     }
 
-    private func mapXCResponseToAPIResult(response: XCAPIResponse, rawData: Data) throws -> APIResult {
+    /// Fetches the counts for live streams, movies, and series concurrently.
+    private func fetchStreamCounts(for entry: IPTVEntry, serverURL: String, username: String, password: String) async -> (live: Int?, movies: Int?, series: Int?) {
+        // A struct to decode the array of items. We only need the count, not the content.
+        struct StreamItem: Codable {}
+
+        async let liveCount = fetchCount(action: "get_live_streams", serverURL: serverURL, username: username, password: password)
+        async let moviesCount = fetchCount(action: "get_vod_streams", serverURL: serverURL, username: username, password: password)
+        async let seriesCount = fetchCount(action: "get_series", serverURL: serverURL, username: username, password: password)
+
+        let counts = await (live: liveCount, movies: moviesCount, series: seriesCount)
+        logger.info("Fetched stream counts for '\(entry.name, privacy: .public)': Live=\(counts.live ?? -1), Movies=\(counts.movies ?? -1), Series=\(counts.series ?? -1)")
+        return counts
+    }
+
+    /// Generic helper to fetch an array from the API and return its count.
+    private func fetchCount(action: String, serverURL: String, username: String, password: String) async -> Int? {
+        struct StreamItem: Codable {}
+
+        var components = URLComponents(string: serverURL)
+        components?.path = "/player_api.php"
+        components?.queryItems = [
+            URLQueryItem(name: "username", value: username),
+            URLQueryItem(name: "password", value: password),
+            URLQueryItem(name: "action", value: action)
+        ]
+
+        guard let url = components?.url else {
+            logger.error("Could not create URL for action '\(action)'")
+            return nil
+        }
+
+        do {
+            let (data, response) = try await session.data(for: URLRequest(url: url))
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                logger.warning("Failed to fetch count for action '\(action)': HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+                return nil
+            }
+            let decodedArray = try JSONDecoder().decode([StreamItem].self, from: data)
+            return decodedArray.count
+        } catch {
+            logger.error("Failed to fetch or decode count for action '\(action)': \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func mapXCResponseToAPIResult(response: XCAPIResponse,
+                                          streamCounts: (live: Int?, movies: Int?, series: Int?),
+                                          rawData: Data) throws -> APIResult {
         guard let userInfo = response.userInfo else {
             throw APIError.invalidResponse(reason: "Response did not contain a 'user_info' object.")
         }
@@ -136,9 +188,9 @@ final class APIService: APIServiceProtocol {
             isTrial: isTrial,
             activeConnections: userInfo.activeCons,
             maxConnections: maxConnections,
-            liveStreamsCount: nil, // Note: Getting stream counts requires separate API calls.
-            moviesCount: nil,
-            seriesCount: nil,
+            liveStreamsCount: streamCounts.live,
+            moviesCount: streamCounts.movies,
+            seriesCount: streamCounts.series,
             rawUserInfoJSON: userInfoJSON,
             rawServerInfoJSON: serverInfoJSON
         )

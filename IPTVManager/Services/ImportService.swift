@@ -22,6 +22,16 @@ final class ImportService {
         let failedCount: Int
     }
 
+    /// Imports a single entry from a full M3U `get.php` URL.
+    /// - Returns: `true` if the import was successful, otherwise `false`.
+    func importEntry(from urlString: String, context: ModelContext) -> Bool {
+        // A single URL import is assumed to be for an Xtream Codes entry.
+        guard urlString.lowercased().contains("get.php?") else {
+            return false
+        }
+        return parseAndAddXCEntry(from: urlString, context: context)
+    }
+
     func importEntries(from fileURL: URL, context: ModelContext) throws -> ImportResult {
         guard fileURL.startAccessingSecurityScopedResource() else {
             throw ImportError.couldNotAccessFile

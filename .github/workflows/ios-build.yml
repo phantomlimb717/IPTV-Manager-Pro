@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - feature-port-ios-pro
     paths:
       - 'IPTVManager/**'
       - 'Package.swift'

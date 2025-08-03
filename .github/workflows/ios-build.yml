@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - feature-port-ios-pro
+      - update-ios-build-workflow
     paths:
       - 'IPTVManager/**'
       - 'Package.swift'

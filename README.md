@@ -55,20 +55,27 @@ No installation is required. Simply download the `IPTV Manager v0.2.4.exe` file 
 
 ## License
 
-This project is licensed under the **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License (CC BY-NC-SA 4.0)**.
+This project is licensed under a custom "source-available" license: the **Apache License 2.0 with the Commons Clause and an Acceptable Use Policy**.
 
-You are free to:
+We believe in open development, but also in protecting the project from being used in a way that goes against its spirit. Here’s a simple breakdown of what that means for you:
 
-- **Share** — copy and redistribute the material in any medium or format.
-- **Adapt** — remix, transform, and build upon the material.
+### The Short Version (What You Need to Know)
 
-Under the following terms:
+This software is free to use for personal, community, and non-commercial purposes. You can download, modify, and share the code freely under the following main conditions:
 
-- **Attribution** — You must give appropriate credit if you use this code.
-- **Non-Commercial** — You may not use the material for commercial purposes.
-- **Share-Alike** — If you remix, transform, or build upon the material, you must distribute your contributions under the same license as the original.
+*   ✅ **You CAN** use this software for free.
+*   ✅ **You CAN** modify the source code for your own purposes.
+*   ✅ **You CAN** share the software and your modifications with others (as long as you include the same license).
 
-For the full license text, please see the [LICENSE](LICENSE) file included in this repository.
+*   ❌ **You CANNOT** sell this software. This means you can't offer it as a paid product, a commercial service, or charge fees for support or hosting that relies substantially on this software's functionality.
+*   ❌ **You CANNOT** use this software for any illegal activities. You are responsible for ensuring your use complies with all local and international laws.
+*   ❌ **You CANNOT** use this software with content that you do not have the legal right to use.
+
+### The Fine Print (Liability)
+
+The software is provided "AS IS", without any warranties.
+
+For the full legal terms and conditions, please see the [LICENSE](LICENSE) file in this repository.
 
 ---
 

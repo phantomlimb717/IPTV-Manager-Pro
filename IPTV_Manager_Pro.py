@@ -1050,10 +1050,9 @@ class PlaylistLoaderWorker(QObject):
 
     @Slot()
     def run(self):
+        playlist_data = {'live': [], 'movie': [], 'series': []}
         try:
             self._session = requests.Session()
-
-            playlist_data = {'live': [], 'movie': [], 'series': []}
             action_map = {'live': 'get_live_streams', 'movie': 'get_vod_streams', 'series': 'get_series'}
 
             server_url = self.entry_data['server_base_url']
@@ -1061,21 +1060,22 @@ class PlaylistLoaderWorker(QObject):
             password = self.entry_data['password']
 
             for cat_type, action in action_map.items():
-                api_url = f"{server_url.rstrip('/')}/player_api.php?username={username}&password={password}&action={action}"
-                response = self._session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
-                response.raise_for_status()
-                data = response.json()
-                if isinstance(data, list):
-                    playlist_data[cat_type] = data
+                try:
+                    api_url = f"{server_url.rstrip('/')}/player_api.php?username={username}&password={password}&action={action}"
+                    response = self._session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
+                    response.raise_for_status()
+                    data = response.json()
+                    if isinstance(data, list):
+                        playlist_data[cat_type] = data
+                except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+                    logging.warning(f"Could not fetch playlist category '{cat_type}': {e}")
+                    # Continue to the next category, this is not a fatal error for the dialog.
 
             self.data_ready.emit(playlist_data)
 
-        except requests.exceptions.RequestException as e:
-            self.error_occurred.emit(f"Network Error: {e}")
-        except json.JSONDecodeError:
-            self.error_occurred.emit("API returned invalid JSON.")
         except Exception as e:
-            self.error_occurred.emit(f"An unexpected error occurred: {e}")
+            # This will catch errors in session creation or other unexpected issues.
+            self.error_occurred.emit(f"An unexpected error occurred during playlist loading: {e}")
         finally:
             if self._session:
                 self._session.close()

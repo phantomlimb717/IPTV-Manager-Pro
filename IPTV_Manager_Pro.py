@@ -1041,6 +1041,7 @@ class BulkEditCategoryDialog(QDialog):
 class PlaylistLoaderWorker(QObject):
     data_ready = Signal(dict)
     error_occurred = Signal(str)
+    finished = Signal()
 
     def __init__(self, entry_data):
         super().__init__()
@@ -1078,10 +1079,12 @@ class PlaylistLoaderWorker(QObject):
         finally:
             if self._session:
                 self._session.close()
+            self.finished.emit()
 
 class SeriesInfoWorker(QObject):
     data_ready = Signal(dict)
     error_occurred = Signal(str)
+    finished = Signal()
 
     def __init__(self, entry_data, series_id):
         super().__init__()
@@ -1112,6 +1115,7 @@ class SeriesInfoWorker(QObject):
         finally:
             if self._session:
                 self._session.close()
+            self.finished.emit()
 
 class PlaylistBrowserDialog(QDialog):
     def __init__(self, entry_data, parent=None):
@@ -2369,11 +2373,6 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG)
     logging.info("Application starting with DEBUG level logging.")
-
-    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
-        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
-        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

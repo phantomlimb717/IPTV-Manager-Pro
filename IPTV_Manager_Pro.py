@@ -1225,8 +1225,16 @@ class PlaylistBrowserDialog(QDialog):
     def on_category_changed(self, current_item, previous_item):
         if not current_item or self.category_list.isHidden():
             return
-        category_key = current_item.text().lower().replace(" ", "_")
-        if category_key == "live_tv": category_key = "live"
+
+        category_text = current_item.text()
+        category_key = ""
+        if category_text == "Live TV":
+            category_key = "live"
+        elif category_text == "Movies":
+            category_key = "movie"
+        elif category_text == "Series":
+            category_key = "series"
+
         streams = self.playlist_data.get(category_key, [])
         self.stream_model.removeRows(0, self.stream_model.rowCount())
         for stream in streams:

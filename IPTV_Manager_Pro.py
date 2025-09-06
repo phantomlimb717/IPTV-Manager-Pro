@@ -1038,7 +1038,7 @@ class BulkEditCategoryDialog(QDialog):
         return self.category_combo.currentText()
 
 
-class PlaylistLoaderWorker(QObject):
+class CategoryLoaderWorker(QObject):
     data_ready = Signal(dict)
     error_occurred = Signal(str)
     finished = Signal()
@@ -1050,10 +1050,11 @@ class PlaylistLoaderWorker(QObject):
 
     @Slot()
     def run(self):
-        playlist_data = {'live': [], 'movie': [], 'series': []}
+        category_data = {'live': [], 'movie': [], 'series': []}
         try:
             self._session = requests.Session()
-            action_map = {'live': 'get_live_streams', 'movie': 'get_vod_streams', 'series': 'get_series'}
+            # Note: Xtream Codes API uses 'get_vod_categories' for movies.
+            action_map = {'live': 'get_live_categories', 'movie': 'get_vod_categories', 'series': 'get_series_categories'}
 
             server_url = self.entry_data['server_base_url']
             username = self.entry_data['username']
@@ -1066,16 +1067,64 @@ class PlaylistLoaderWorker(QObject):
                     response.raise_for_status()
                     data = response.json()
                     if isinstance(data, list):
-                        playlist_data[cat_type] = data
+                        category_data[cat_type] = data
                 except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-                    logging.warning(f"Could not fetch playlist category '{cat_type}': {e}")
-                    # Continue to the next category, this is not a fatal error for the dialog.
+                    logging.warning(f"Could not fetch categories for type '{cat_type}': {e}")
 
-            self.data_ready.emit(playlist_data)
+            self.data_ready.emit(category_data)
 
         except Exception as e:
-            # This will catch errors in session creation or other unexpected issues.
-            self.error_occurred.emit(f"An unexpected error occurred during playlist loading: {e}")
+            self.error_occurred.emit(f"An unexpected error occurred while loading categories: {e}")
+        finally:
+            if self._session:
+                self._session.close()
+            self.finished.emit()
+
+class StreamLoaderWorker(QObject):
+    data_ready = Signal(list)
+    error_occurred = Signal(str)
+    finished = Signal()
+
+    def __init__(self, entry_data, category_id, stream_type):
+        super().__init__()
+        self.entry_data = entry_data
+        self.category_id = category_id
+        self.stream_type = stream_type # 'live', 'movie', or 'series'
+        self._session = None
+
+    @Slot()
+    def run(self):
+        try:
+            self._session = requests.Session()
+            action_map = {
+                'live': 'get_live_streams',
+                'movie': 'get_vod_streams',
+                'series': 'get_series'
+            }
+            action = action_map.get(self.stream_type)
+            if not action:
+                raise ValueError(f"Invalid stream type: {self.stream_type}")
+
+            server_url = self.entry_data['server_base_url']
+            username = self.entry_data['username']
+            password = self.entry_data['password']
+
+            api_url = f"{server_url.rstrip('/')}/player_api.php?username={username}&password={password}&action={action}&category_id={self.category_id}"
+            response = self._session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
+            response.raise_for_status()
+            data = response.json()
+
+            if isinstance(data, list):
+                self.data_ready.emit(data)
+            else:
+                self.error_occurred.emit(f"Unexpected data returned for streams: {str(data)[:200]}")
+
+        except requests.exceptions.RequestException as e:
+            self.error_occurred.emit(f"Network Error fetching streams: {e}")
+        except json.JSONDecodeError:
+            self.error_occurred.emit("API returned invalid JSON for streams.")
+        except Exception as e:
+            self.error_occurred.emit(f"An unexpected error occurred loading streams: {e}")
         finally:
             if self._session:
                 self._session.close()
@@ -1122,8 +1171,9 @@ class PlaylistBrowserDialog(QDialog):
         super().__init__(parent)
         self.entry_data = entry_data
         self.media_player_manager = MediaPlayerManager()
-        self.playlist_data = {}
-        self.worker_thread = None
+        self.category_data = {} # Renamed from playlist_data
+        self.category_worker_thread = None
+        self.stream_worker_thread = None
         self.series_info_thread = None
         self.original_window_title = f"Playlist for {self.entry_data['name']}"
 
@@ -1132,12 +1182,12 @@ class PlaylistBrowserDialog(QDialog):
         self.setWindowModality(Qt.WindowModal)
 
         # UI Elements
-        self.category_list = QListWidget()
+        self.category_tree = QTreeWidget()
+        self.category_tree.setHeaderHidden(True)
         self.stream_table = QTableView()
         self.search_bar = QLineEdit()
         self.play_button = QPushButton("Play Selected")
-        self.back_button = QPushButton("<< Back to Categories")
-        self.status_label = QLabel("Loading playlist...")
+        self.status_label = QLabel("Loading categories...")
 
         # Models for the table
         self.stream_model = QStandardItemModel(0, 2) # Name, Stream ID (hidden)
@@ -1163,9 +1213,7 @@ class PlaylistBrowserDialog(QDialog):
         self.left_widget = QWidget()
         left_layout = QVBoxLayout(self.left_widget)
         left_layout.addWidget(QLabel("Categories"))
-        left_layout.addWidget(self.category_list)
-        left_layout.addWidget(self.back_button)
-        self.back_button.hide()
+        left_layout.addWidget(self.category_tree)
 
         right_layout = QVBoxLayout()
         search_layout = QHBoxLayout()
@@ -1185,34 +1233,42 @@ class PlaylistBrowserDialog(QDialog):
 
     def setup_connections(self):
         self.search_bar.textChanged.connect(self.proxy_model.setFilterRegularExpression)
-        self.category_list.currentItemChanged.connect(self.on_category_changed)
+        self.category_tree.itemClicked.connect(self.on_category_clicked)
         self.play_button.clicked.connect(self.on_play_clicked)
         self.stream_table.doubleClicked.connect(self.on_play_clicked)
-        self.back_button.clicked.connect(self.show_categories_view)
 
     def load_playlist_data(self):
-        # Implementation of threaded playlist loading...
-        self.worker = PlaylistLoaderWorker(self.entry_data)
-        self.worker_thread = QThread()
-        self.worker.moveToThread(self.worker_thread)
-        self.worker_thread.started.connect(self.worker.run)
-        self.worker.data_ready.connect(self.on_data_ready)
-        self.worker.error_occurred.connect(self.on_load_error)
-        self.worker.finished.connect(self.worker_thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
-        self.worker_thread.start()
+        # This is now for loading categories
+        self.category_worker = CategoryLoaderWorker(self.entry_data)
+        self.category_worker_thread = QThread()
+        self.category_worker.moveToThread(self.category_worker_thread)
+        self.category_worker_thread.started.connect(self.category_worker.run)
+        self.category_worker.data_ready.connect(self.on_categories_ready)
+        self.category_worker.error_occurred.connect(self.on_load_error)
+        self.category_worker.finished.connect(self.category_worker_thread.quit)
+        self.category_worker.finished.connect(self.category_worker.deleteLater)
+        self.category_worker_thread.finished.connect(self.category_worker_thread.deleteLater)
+        self.category_worker_thread.start()
 
     @Slot(dict)
-    def on_data_ready(self, data):
-        self.playlist_data = data
-        self.show_categories_view()
-        if self.category_list.count() > 0:
-            self.category_list.setCurrentRow(0)
-            self.status_label.setText("Ready.")
-        else:
-            self.status_label.setText("Playlist is empty.")
-        self.worker_thread.quit()
+    def on_categories_ready(self, data):
+        self.category_data = data
+        self.category_tree.clear()
+
+        type_map = {'live': "Live TV", 'movie': "Movies", 'series': "Series"}
+
+        for cat_type, categories in self.category_data.items():
+            if categories:
+                top_level_item = QTreeWidgetItem([type_map[cat_type]])
+                self.category_tree.addTopLevelItem(top_level_item)
+                for category in categories:
+                    child_item = QTreeWidgetItem([category['category_name']])
+                    child_item.setData(0, Qt.UserRole, {'type': cat_type, 'id': category['category_id']})
+                    top_level_item.addChild(child_item)
+
+        self.category_tree.expandAll()
+        self.status_label.setText("Ready. Select a category.")
+        self.category_worker_thread.quit()
 
     @Slot(str)
     def on_load_error(self, error_message):
@@ -1221,26 +1277,47 @@ class PlaylistBrowserDialog(QDialog):
         if self.worker_thread: self.worker_thread.quit()
         if self.series_info_thread: self.series_info_thread.quit()
 
-    @Slot(QListWidgetItem)
-    def on_category_changed(self, current_item, previous_item):
-        if not current_item or self.category_list.isHidden():
+    @Slot(QTreeWidgetItem, int)
+    def on_category_clicked(self, item, column):
+        category_info = item.data(0, Qt.UserRole)
+        if not category_info: # It's a top-level item like "Live TV"
             return
 
-        category_text = current_item.text()
-        category_key = ""
-        if category_text == "Live TV":
-            category_key = "live"
-        elif category_text == "Movies":
-            category_key = "movie"
-        elif category_text == "Series":
-            category_key = "series"
+        cat_id = category_info['id']
+        stream_type = category_info['type']
 
-        streams = self.playlist_data.get(category_key, [])
+        self.status_label.setText(f"Loading {item.text(0)}...")
+        self.stream_model.removeRows(0, self.stream_model.rowCount())
+
+        # Start the stream loader worker
+        self.stream_worker = StreamLoaderWorker(self.entry_data, cat_id, stream_type)
+        self.stream_worker_thread = QThread()
+        self.stream_worker.moveToThread(self.stream_worker_thread)
+        self.stream_worker_thread.started.connect(self.stream_worker.run)
+        self.stream_worker.data_ready.connect(self.on_streams_ready)
+        self.stream_worker.error_occurred.connect(self.on_load_error)
+        self.stream_worker.finished.connect(self.stream_worker_thread.quit)
+        self.stream_worker.finished.connect(self.stream_worker.deleteLater)
+        self.stream_worker_thread.finished.connect(self.stream_worker_thread.deleteLater)
+        self.stream_worker_thread.start()
+
+    @Slot(list)
+    def on_streams_ready(self, streams):
         self.stream_model.removeRows(0, self.stream_model.rowCount())
         for stream in streams:
-            name_item = QStandardItem(stream.get('name', 'No Name'))
-            stream_id_item = QStandardItem(str(stream.get('stream_id')))
-            self.stream_model.appendRow([name_item, stream_id_item])
+            name = stream.get('name', 'No Name')
+            stream_id = str(stream.get('stream_id'))
+
+            # For VOD, name might be None, but title might exist
+            if not name and 'title' in stream:
+                name = stream.get('title')
+
+            name_item = QStandardItem(name)
+            id_item = QStandardItem(stream_id)
+            self.stream_model.appendRow([name_item, id_item])
+
+        self.status_label.setText(f"Loaded {len(streams)} items.")
+        self.stream_worker_thread.quit()
 
     def on_play_clicked(self):
         selected_indexes = self.stream_table.selectionModel().selectedRows()
@@ -1304,23 +1381,18 @@ class PlaylistBrowserDialog(QDialog):
                 id_item = QStandardItem(episode_id)
                 self.stream_model.appendRow([name_item, id_item])
 
-        self.category_list.hide()
-        self.back_button.show()
+        # self.category_list.hide() # QTreeWidget is used now
+        # self.back_button.show() # Back button is removed
         self.status_label.setText(f"Loaded {self.stream_model.rowCount()} episodes.")
         self.series_info_thread.quit()
 
-    def show_categories_view(self):
-        self.setWindowTitle(self.original_window_title)
-        self.stream_model.removeRows(0, self.stream_model.rowCount())
-        self.category_list.show()
-        self.back_button.hide()
-        if self.category_list.currentItem():
-            self.on_category_changed(self.category_list.currentItem(), None)
-
     def closeEvent(self, event):
-        if self.worker_thread and self.worker_thread.isRunning():
-            self.worker_thread.quit()
-            self.worker_thread.wait()
+        if self.category_worker_thread and self.category_worker_thread.isRunning():
+            self.category_worker_thread.quit()
+            self.category_worker_thread.wait()
+        if self.stream_worker_thread and self.stream_worker_thread.isRunning():
+            self.stream_worker_thread.quit()
+            self.stream_worker_thread.wait()
         if self.series_info_thread and self.series_info_thread.isRunning():
             self.series_info_thread.quit()
             self.series_info_thread.wait()

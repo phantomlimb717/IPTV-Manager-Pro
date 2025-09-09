@@ -1279,9 +1279,6 @@ class PlaylistBrowserDialog(QDialog):
 
     @Slot(QTreeWidgetItem, int)
     def on_category_clicked(self, item, column):
-        if self.windowTitle() != self.original_window_title:
-            self.setWindowTitle(self.original_window_title)
-
         category_info = item.data(0, Qt.UserRole)
         if not category_info: # It's a top-level item like "Live TV"
             return
@@ -1324,39 +1321,18 @@ class PlaylistBrowserDialog(QDialog):
 
     def on_play_clicked(self):
         selected_indexes = self.stream_table.selectionModel().selectedRows()
-        if not selected_indexes:
-            return
-
+        if not selected_indexes: return
         source_index = self.proxy_model.mapToSource(selected_indexes[0])
         stream_id = self.stream_model.item(source_index.row(), 1).text()
 
-        # Check if we are in an episode view by checking the window title,
-        # which is changed when series info is loaded.
-        if self.windowTitle() != self.original_window_title:
-            self.play_episode(stream_id)
-            return
-
-        # If not in episode view, determine type from category tree
-        current_item = self.category_tree.currentItem()
-        if not current_item:
-            QMessageBox.warning(self, "No Category Selected", "Please select a category from the list before playing.")
-            return
-
-        # Determine the top-level category (Live TV, Movies, Series)
-        parent = current_item.parent()
-        if parent:
-            top_level_category_name = parent.text(0)
-        else:
-            top_level_category_name = current_item.text(0)
-
-        if top_level_category_name == 'Series':
+        if self.category_list.isHidden():
+             self.play_episode(stream_id)
+             return
+        selected_category = self.category_list.currentItem().text()
+        if selected_category == 'Series':
             self.fetch_series_episodes(stream_id)
-        elif top_level_category_name == 'Movies':
-            self.play_vod_or_live(stream_id, 'Movies') # Pass 'Movies' to play_vod_or_live
-        elif top_level_category_name == 'Live TV':
-            self.play_vod_or_live(stream_id, 'Live TV') # Pass 'Live TV' for play_vod_or_live
         else:
-            QMessageBox.warning(self, "Error", f"Could not determine stream type for category '{top_level_category_name}'.")
+            self.play_vod_or_live(stream_id, selected_category)
 
     def play_vod_or_live(self, stream_id, category):
         server = self.entry_data['server_base_url']

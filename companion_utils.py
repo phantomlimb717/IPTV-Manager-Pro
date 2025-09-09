@@ -64,13 +64,13 @@ class MediaPlayerManager:
     def play_stream(self, stream_url, parent_widget=None):
         """
         Play a stream URL using the best available media player.
-        It first tries ffplay, then falls back to mpv.
+        It first tries mpv, then falls back to ffplay.
         """
         player_to_use = None
-        if self.check_player_availability("ffplay"):
-            player_to_use = "ffplay"
-        elif self.check_player_availability("mpv"):
+        if self.check_player_availability("mpv"):
             player_to_use = "mpv"
+        elif self.check_player_availability("ffplay"):
+            player_to_use = "ffplay"
         else:
             self._show_player_not_found_error(parent_widget)
             return False

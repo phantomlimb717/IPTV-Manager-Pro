@@ -29,7 +29,7 @@ No installation is required. Simply download the `IPTV_Manager_Pro.exe` file and
 
 ## Usage
 
-1.  Download `IPTV Manager v0.2.4.exe` (or the latest version) from the latest release.
+1.  Download `IPTV_Manager_Pro.exe` (or the latest version) from the latest release.
 2.  Run the executable file. The application is portable and will create its database (`iptv_store.db`) and log files in the same folder it is run from.
 3.  Use the `Add Entry` or `Import URL` buttons to add your first account.
     *   When clicking `Add Entry`, you can now choose the "Account Type":

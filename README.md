@@ -25,7 +25,7 @@ A desktop application for managing and checking the status of IPTV account crede
 
 You can download the latest pre-compiled application for Windows from the official **[Releases Page](https://github.com/phantomlimb717/IPTV-Manager-Pro/releases)**.
 
-No installation is required. Simply download the `IPTV Manager v0.2.4.exe` file and run it.
+No installation is required. Simply download the `IPTV_Manager_Pro.exe` file and run it.
 
 ## Usage
 

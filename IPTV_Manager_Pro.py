@@ -1276,8 +1276,12 @@ class PlaylistBrowserDialog(QDialog):
     def on_load_error(self, error_message):
         QMessageBox.critical(self, "Error Loading Playlist", error_message)
         self.status_label.setText(f"Error: {error_message}")
-        if self.worker_thread: self.worker_thread.quit()
-        if self.series_info_thread: self.series_info_thread.quit()
+        if self.category_worker_thread and self.category_worker_thread.isRunning():
+            self.category_worker_thread.quit()
+        if self.stream_worker_thread and self.stream_worker_thread.isRunning():
+            self.stream_worker_thread.quit()
+        if self.series_info_thread and self.series_info_thread.isRunning():
+            self.series_info_thread.quit()
 
     @Slot(QTreeWidgetItem, int)
     def on_category_clicked(self, item, column):

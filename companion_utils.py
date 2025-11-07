@@ -49,18 +49,18 @@ class MediaPlayerManager:
     def get_player_command(self, stream_url, player_type):
         """Generate the appropriate command line for playing a stream"""
         executable = self.get_player_executable(player_type)
+        # Using a common User-Agent can help with servers that block default ffplay/ffmpeg/mpv agents.
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
 
         if player_type == "mpv":
             if self.current_os == "windows":
                 # MPV on Windows with WASAPI audio output
-                return [executable, "--fs", "--keep-open=no", "--ao=wasapi", stream_url]
+                return [executable, "--user-agent", user_agent, "--fs", "--keep-open=no", "--ao=wasapi", stream_url]
             else:
                 # MPV on Linux/macOS with PulseAudio/ALSA fallback
-                return [executable, "--fs", "--keep-open=no", "--ao=pulse,alsa", stream_url]
+                return [executable, "--user-agent", user_agent, "--fs", "--keep-open=no", "--ao=pulse,alsa", stream_url]
         else:  # ffplay
             # FFplay command line arguments
-            # Using a common User-Agent can help with servers that block default ffplay/ffmpeg agents.
-            user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
             return [executable, "-user_agent", user_agent, "-fs", "-noborder", "-autoexit", stream_url]
 
     def play_stream(self, stream_url, parent_widget=None):

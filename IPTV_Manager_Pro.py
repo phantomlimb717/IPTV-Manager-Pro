@@ -22,6 +22,8 @@ except ImportError:
 
 try:
     import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 except ImportError:
     print("\nError: Required library 'requests' not found. Please install it: pip install requests", file=sys.stderr)
     sys.exit(1)
@@ -63,7 +65,7 @@ APP_VERSION = "0.3" # Incremented version for new features
 DATABASE_NAME = 'iptv_store.db'
 LOG_FILE = 'iptv_manager_log.txt'
 USER_AGENT = f'{APP_NAME}/{APP_VERSION} (okhttp/3.12.1)'
-API_TIMEOUT = 5
+API_TIMEOUT = (5, 10) # (connect, read) seconds
 REQUEST_DELAY_BETWEEN_CHECKS = 0.2
 SETTINGS_FILE = "settings.json"
 
@@ -482,8 +484,8 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
         processed_data['api_message'] = f"HTTP Error {e.response.status_code}"
         if response_text and ('raw_user_info' not in processed_data or not processed_data['raw_user_info']):
              processed_data['raw_user_info'] = json.dumps({"error_context_response": response_text[:500]})
-    except requests.exceptions.RequestException:
-        processed_data['api_message'] = "Connection Error"
+    except requests.exceptions.RequestException as e:
+        processed_data['api_message'] = f"Connection Error: {type(e).__name__}"
     except json.JSONDecodeError:
         processed_data['api_message'] = "Invalid JSON response"
         if response_text and ('raw_user_info' not in processed_data or not processed_data['raw_user_info']):
@@ -1442,15 +1444,23 @@ class ApiCheckerWorker(QObject):
     def initialize_session(self):
         if not self._session:
             try:
-                logging.info("API Worker: Initializing session...")
+                logging.info("API Worker: Initializing session with retries...")
                 self._session = requests.Session()
+                retry_strategy = Retry(
+                    total=3,
+                    backoff_factor=1,
+                    status_forcelist=[429, 500, 502, 503, 504],
+                    allowed_methods=["HEAD", "GET", "OPTIONS"]
+                )
+                adapter = HTTPAdapter(max_retries=retry_strategy)
+                self._session.mount("http://", adapter)
+                self._session.mount("https://", adapter)
                 logging.info("API Worker: Session initialized.")
-                self.session_initialized_signal.emit() # Notify that session is ready
+                self.session_initialized_signal.emit()
             except Exception as e:
                 logging.error(f"API Worker: Failed to initialize session: {e}")
-                # Optionally, emit a failure signal or handle error
                 self.status_message_updated.emit("Error: Could not initialize network session.")
-                self._is_running = False # Stop further processing if session fails
+                self._is_running = False
 
     @Slot()
     def stop_processing(self):
@@ -2385,21 +2395,17 @@ class MainWindow(QMainWindow):
 
 
     def closeEvent(self, event):
-        self.save_settings() # Save settings on close
-        if self._is_checking_api:
-            reply = QMessageBox.question(self, "Confirm Exit", "API checks in progress. Exit anyway?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                logging.info("User chose to exit during API checks.")
-                if self.api_worker:
-                    self.api_worker.stop_processing()
-                if self.api_thread:
-                    self.api_thread.quit()
-                event.accept()
-            else:
-                event.ignore()
-                return
-        else:
-            event.accept()
+        self.save_settings()
+        if self._is_checking_api and self.api_thread and self.api_thread.isRunning():
+            logging.info("Attempting to stop API worker thread before closing...")
+            self.api_worker.stop_processing()
+            self.api_thread.quit()
+            # Wait a bit for the thread to finish gracefully.
+            if not self.api_thread.wait(1000): # Wait 1 sec
+                logging.warning("API thread did not stop gracefully. Forcing termination.")
+                self.api_thread.terminate() # Fallback if it doesn't quit
+                self.api_thread.wait() # Wait for termination
+        event.accept()
         logging.info(f"{APP_NAME} closing.")
 
     def load_settings(self):

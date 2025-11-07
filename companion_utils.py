@@ -55,10 +55,10 @@ class MediaPlayerManager:
         if player_type == "mpv":
             if self.current_os == "windows":
                 # MPV on Windows with WASAPI audio output
-                return [executable, "--user-agent", user_agent, "--fs", "--keep-open=no", "--ao=wasapi", stream_url]
+                return [executable, "--user-agent=" + user_agent, "--fs", "--keep-open=no", "--ao=wasapi", stream_url]
             else:
                 # MPV on Linux/macOS with PulseAudio/ALSA fallback
-                return [executable, "--user-agent", user_agent, "--fs", "--keep-open=no", "--ao=pulse,alsa", stream_url]
+                return [executable, "--user-agent=" + user_agent, "--fs", "--keep-open=no", "--ao=pulse,alsa", stream_url]
         else:  # ffplay
             # FFplay command line arguments
             return [executable, "-user_agent", user_agent, "-fs", "-noborder", "-autoexit", stream_url]

@@ -53,12 +53,18 @@ class MediaPlayerManager:
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
 
         if player_type == "mpv":
+            common_args = [
+                "--user-agent=" + user_agent,
+                "--fs",
+                "--keep-open=no",
+                "--ytdl=no"  # Disable youtube-dl hook
+            ]
             if self.current_os == "windows":
                 # MPV on Windows with WASAPI audio output
-                return [executable, "--user-agent=" + user_agent, "--fs", "--keep-open=no", "--ao=wasapi", stream_url]
+                return [executable] + common_args + ["--ao=wasapi", stream_url]
             else:
-                # MPV on Linux/macOS, use --user-agent=value format and let mpv auto-select the audio driver.
-                return [executable, "--user-agent=" + user_agent, "--fs", "--keep-open=no", stream_url]
+                # MPV on Linux/macOS, let mpv auto-select the audio driver.
+                return [executable] + common_args + [stream_url]
         else:  # ffplay
             # FFplay command line arguments
             return [executable, "-user_agent", user_agent, "-fs", "-noborder", "-autoexit", stream_url]

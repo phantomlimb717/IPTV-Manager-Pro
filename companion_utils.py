@@ -53,15 +53,17 @@ class MediaPlayerManager:
         user_agent = "VLC/3.0.18"
 
         if player_type == "mpv":
+            headers = [f"User-Agent: {user_agent}"]
+            if referer_url:
+                headers.append(f"Referer: {referer_url}")
+
             common_args = [
                 "--no-config",
-                "--user-agent=" + user_agent,
+                f"--http-header-fields={','.join(headers)}",
                 "--fs",
                 "--keep-open=no",
                 "--ytdl=no"  # Disable youtube-dl hook
             ]
-            if referer_url:
-                common_args.append("--referrer=" + referer_url)
 
             if self.current_os == "windows":
                 # MPV on Windows with WASAPI audio output

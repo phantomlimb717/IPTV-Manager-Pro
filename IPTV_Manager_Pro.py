@@ -1283,7 +1283,6 @@ class PlaylistBrowserDialog(QDialog):
         self.category_worker.error_occurred.connect(self.on_load_error)
         self.category_worker.finished.connect(self.category_worker_thread.quit)
         self.category_worker.finished.connect(self.category_worker.deleteLater)
-        self.category_worker_thread.finished.connect(self.category_worker_thread.deleteLater)
         self.category_worker_thread.start()
 
     @Slot(dict)
@@ -1369,7 +1368,6 @@ class PlaylistBrowserDialog(QDialog):
         self.stream_worker.error_occurred.connect(self.on_load_error)
         self.stream_worker.finished.connect(self.stream_worker_thread.quit)
         self.stream_worker.finished.connect(self.stream_worker.deleteLater)
-        self.stream_worker_thread.finished.connect(self.stream_worker_thread.deleteLater)
         self.stream_worker_thread.start()
 
     @Slot(list)
@@ -1456,7 +1454,6 @@ class PlaylistBrowserDialog(QDialog):
         self.series_worker.error_occurred.connect(self.on_load_error)
         self.series_worker.finished.connect(self.series_info_thread.quit)
         self.series_worker.finished.connect(self.series_worker.deleteLater)
-        self.series_info_thread.finished.connect(self.series_info_thread.deleteLater)
         self.series_info_thread.start()
 
     @Slot(dict)

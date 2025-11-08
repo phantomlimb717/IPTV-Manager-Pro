@@ -54,6 +54,7 @@ class MediaPlayerManager:
 
         if player_type == "mpv":
             common_args = [
+                "--no-config",
                 "--user-agent=" + user_agent,
                 "--fs",
                 "--keep-open=no",

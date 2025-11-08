@@ -1371,14 +1371,14 @@ class PlaylistBrowserDialog(QDialog):
         stream_type = 'movie' if category == 'Movies' else 'live'
         extension = ".mp4" if category == 'Movies' else ".ts"
         stream_url = f"{server}/{stream_type}/{username}/{password}/{stream_id}{extension}"
-        self.media_player_manager.play_stream(stream_url, self)
+        self.media_player_manager.play_stream(stream_url, self, referer_url=server)
 
     def play_episode(self, stream_id):
         server = self.entry_data['server_base_url']
         username = self.entry_data['username']
         password = self.entry_data['password']
         stream_url = f"{server}/series/{username}/{password}/{stream_id}.mp4"
-        self.media_player_manager.play_stream(stream_url, self)
+        self.media_player_manager.play_stream(stream_url, self, referer_url=server)
 
     def fetch_series_episodes(self, series_id):
         self.status_label.setText(f"Fetching episodes for series ID: {series_id}...")

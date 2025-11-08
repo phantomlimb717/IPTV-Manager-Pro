@@ -46,7 +46,7 @@ class MediaPlayerManager:
         executable = self.get_player_executable(player_type)
         return shutil.which(executable) is not None
 
-    def get_player_command(self, stream_url, player_type):
+    def get_player_command(self, stream_url, player_type, referer_url=None):
         """Generate the appropriate command line for playing a stream"""
         executable = self.get_player_executable(player_type)
         # Using a VLC User-Agent is often required for IPTV streams.
@@ -60,6 +60,9 @@ class MediaPlayerManager:
                 "--keep-open=no",
                 "--ytdl=no"  # Disable youtube-dl hook
             ]
+            if referer_url:
+                common_args.append("--referrer=" + referer_url)
+
             if self.current_os == "windows":
                 # MPV on Windows with WASAPI audio output
                 return [executable] + common_args + ["--ao=wasapi", stream_url]
@@ -67,10 +70,14 @@ class MediaPlayerManager:
                 # MPV on Linux/macOS, let mpv auto-select the audio driver.
                 return [executable] + common_args + [stream_url]
         else:  # ffplay
-            # FFplay command line arguments
-            return [executable, "-user_agent", user_agent, "-fs", "-noborder", "-autoexit", stream_url]
+            headers = f"User-Agent: {user_agent}"
+            if referer_url:
+                headers += f"\\r\\nReferer: {referer_url}"
 
-    def play_stream(self, stream_url, parent_widget=None):
+            # FFplay command line arguments
+            return [executable, "-headers", headers, "-fs", "-noborder", "-autoexit", stream_url]
+
+    def play_stream(self, stream_url, parent_widget=None, referer_url=None):
         """
         Play a stream URL using the best available media player.
         It first tries mpv, then falls back to ffplay.
@@ -84,7 +91,7 @@ class MediaPlayerManager:
             self._show_player_not_found_error(parent_widget)
             return False
 
-        command = self.get_player_command(stream_url, player_to_use)
+        command = self.get_player_command(stream_url, player_to_use, referer_url)
 
         try:
             # Using Popen to run in a non-blocking way

@@ -1111,7 +1111,9 @@ class StreamLoaderWorker(QObject):
             username = self.entry_data['username']
             password = self.entry_data['password']
 
-            api_url = f"{server_url.rstrip('/')}/player_api.php?username={username}&password={password}&action={action}&category_id={self.category_id}"
+            api_url = f"{server_url.rstrip('/')}/player_api.php?username={username}&password={password}&action={action}"
+            if self.category_id != '*':
+                api_url += f"&category_id={self.category_id}"
             response = self._session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
             response.raise_for_status()
             data = response.json()
@@ -1263,6 +1265,12 @@ class PlaylistBrowserDialog(QDialog):
             if categories:
                 top_level_item = QTreeWidgetItem([type_map[cat_type]])
                 self.category_tree.addTopLevelItem(top_level_item)
+
+                # Add "All" sub-category
+                all_child_item = QTreeWidgetItem(["All"])
+                all_child_item.setData(0, Qt.UserRole, {'type': cat_type, 'id': '*'})
+                top_level_item.addChild(all_child_item)
+
                 for category in categories:
                     child_item = QTreeWidgetItem([category['category_name']])
                     child_item.setData(0, Qt.UserRole, {'type': cat_type, 'id': category['category_id']})
@@ -1289,11 +1297,24 @@ class PlaylistBrowserDialog(QDialog):
             self.setWindowTitle(self.original_window_title)
 
         category_info = item.data(0, Qt.UserRole)
-        if not category_info: # It's a top-level item like "Live TV"
-            return
+        cat_id = None
+        stream_type = None
 
-        cat_id = category_info['id']
-        stream_type = category_info['type']
+        if category_info: # It's a sub-category item
+            cat_id = category_info.get('id', '*') # Use '*' for 'All'
+            stream_type = category_info.get('type')
+        elif not item.parent(): # It's a top-level item
+            top_level_text = item.text(0)
+            if top_level_text == "Live TV":
+                stream_type = 'live'
+            elif top_level_text == "Movies":
+                stream_type = 'movie'
+            elif top_level_text == "Series":
+                stream_type = 'series'
+            cat_id = '*' # Signal to load all streams
+
+        if not stream_type:
+            return
 
         self.status_label.setText(f"Loading {item.text(0)}...")
         self.stream_model.removeRows(0, self.stream_model.rowCount())

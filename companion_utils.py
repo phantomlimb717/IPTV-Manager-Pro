@@ -49,8 +49,8 @@ class MediaPlayerManager:
     def get_player_command(self, stream_url, player_type):
         """Generate the appropriate command line for playing a stream"""
         executable = self.get_player_executable(player_type)
-        # Using a common User-Agent can help with servers that block default ffplay/ffmpeg/mpv agents.
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+        # Using a VLC User-Agent is often required for IPTV streams.
+        user_agent = "VLC/3.0.18"
 
         if player_type == "mpv":
             common_args = [

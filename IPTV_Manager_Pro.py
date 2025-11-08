@@ -1170,6 +1170,38 @@ class SeriesInfoWorker(QObject):
                 self._session.close()
             self.finished.emit()
 
+class PlaylistFilterProxyModel(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._search_terms = []
+
+    def set_search_text(self, text):
+        """Splits the search text into terms and triggers a filter update."""
+        self._search_terms = text.lower().split()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        """
+        Accepts a row if its name contains all of the search terms.
+        The search is case-insensitive.
+        """
+        if not self._search_terms:
+            return True # No filter, show all
+
+        index = self.sourceModel().index(source_row, 0, source_parent)
+        item_text = self.sourceModel().data(index, Qt.DisplayRole)
+        if not item_text:
+            return False
+
+        item_text_lower = item_text.lower()
+
+        # Check if all search terms are in the item text
+        for term in self._search_terms:
+            if term not in item_text_lower:
+                return False
+
+        return True
+
 class PlaylistBrowserDialog(QDialog):
     def __init__(self, entry_data, parent=None):
         super().__init__(parent)
@@ -1196,7 +1228,7 @@ class PlaylistBrowserDialog(QDialog):
         # Models for the table
         self.stream_model = QStandardItemModel(0, 2) # Name, Stream ID (hidden)
         self.stream_model.setHorizontalHeaderLabels(["Name", "Stream ID"])
-        self.proxy_model = QSortFilterProxyModel()
+        self.proxy_model = PlaylistFilterProxyModel()
         self.proxy_model.setSourceModel(self.stream_model)
         self.proxy_model.setFilterKeyColumn(0)
         self.stream_table.setModel(self.proxy_model)
@@ -1236,7 +1268,7 @@ class PlaylistBrowserDialog(QDialog):
         self.main_layout.addLayout(right_layout, 3)
 
     def setup_connections(self):
-        self.search_bar.textChanged.connect(self.proxy_model.setFilterRegularExpression)
+        self.search_bar.textChanged.connect(self.proxy_model.set_search_text)
         self.category_tree.itemClicked.connect(self.on_category_clicked)
         self.play_button.clicked.connect(self.on_play_clicked)
         self.stream_table.doubleClicked.connect(self.on_play_clicked)
@@ -1421,16 +1453,35 @@ class PlaylistBrowserDialog(QDialog):
         self.setWindowTitle(f"Episodes for: {series_name}")
 
         episodes = data.get('episodes', {})
-        # Assuming episodes is a dict of seasons
-        for season_num, season_episodes in episodes.items():
-            for episode in season_episodes:
-                title = episode.get('title', 'No Title')
-                episode_id = str(episode.get('id'))
-                # You might want to add season/episode number to title
-                display_title = f"S{episode.get('season')} E{episode.get('episode_num')} - {title}"
-                name_item = QStandardItem(display_title)
-                id_item = QStandardItem(episode_id)
-                self.stream_model.appendRow([name_item, id_item])
+
+        # Helper function to add an episode to the model
+        def add_episode_to_model(episode):
+            title = episode.get('title', 'No Title')
+            episode_id = str(episode.get('id'))
+            season_num = episode.get('season', 0)
+            episode_num = episode.get('episode_num', 0)
+
+            display_title = f"S{season_num} E{episode_num} - {title}"
+            name_item = QStandardItem(display_title)
+            id_item = QStandardItem(episode_id)
+            self.stream_model.appendRow([name_item, id_item])
+
+        # Handle both dictionary (grouped by season) and list (flat) of episodes
+        if isinstance(episodes, dict):
+            # Sort seasons numerically if possible
+            try:
+                sorted_seasons = sorted(episodes.keys(), key=int)
+            except (ValueError, TypeError):
+                sorted_seasons = sorted(episodes.keys())
+
+            for season_num in sorted_seasons:
+                season_episodes = episodes[season_num]
+                if isinstance(season_episodes, list):
+                    for episode in season_episodes:
+                        add_episode_to_model(episode)
+        elif isinstance(episodes, list):
+            for episode in episodes:
+                add_episode_to_model(episode)
 
         # self.category_list.hide() # QTreeWidget is used now
         # self.back_button.show() # Back button is removed

@@ -1325,6 +1325,15 @@ class PlaylistBrowserDialog(QDialog):
 
     @Slot(QTreeWidgetItem, int)
     def on_category_clicked(self, item, column):
+        # Stop any existing worker threads before starting a new one
+        if self.stream_worker_thread and self.stream_worker_thread.isRunning():
+            self.stream_worker_thread.quit()
+            self.stream_worker_thread.wait() # Wait for the thread to finish
+
+        if self.series_info_thread and self.series_info_thread.isRunning():
+            self.series_info_thread.quit()
+            self.series_info_thread.wait()
+
         if self.windowTitle() != self.original_window_title:
             self.setWindowTitle(self.original_window_title)
 
@@ -1434,6 +1443,10 @@ class PlaylistBrowserDialog(QDialog):
         self.media_player_manager.play_stream(stream_url, self, referer_url=server)
 
     def fetch_series_episodes(self, series_id):
+        if self.series_info_thread and self.series_info_thread.isRunning():
+            self.series_info_thread.quit()
+            self.series_info_thread.wait()
+
         self.status_label.setText(f"Fetching episodes for series ID: {series_id}...")
         self.series_worker = SeriesInfoWorker(self.entry_data, series_id)
         self.series_info_thread = QThread()

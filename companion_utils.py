@@ -4,42 +4,59 @@ import os
 import platform
 import subprocess
 import shutil
+import logging
+import json
 
-# Note: IPTV-Manager-Pro uses PySide6. The original code was PyQt6.
-# Most of the API is compatible.
 from PySide6.QtWidgets import QMessageBox
 
 class MediaPlayerManager:
     """
-    Manages media player selection and execution across platforms.
-    Adapted from iptv-companion-copy.
+    Manages media player selection, configuration, and execution across platforms.
     """
+    PLAYER_CONFIG = {
+        "mpv": {
+            "base_args": [
+                "--no-config",
+                "--ytdl=no",
+                "--fs",
+                "--keep-open=no",
+            ],
+            "windows": ["--ao=wasapi"],
+            "darwin": [],
+            "linux": [],
+        },
+        "ffplay": {
+            "base_args": [
+                "-fs",
+                "-noborder",
+                "-autoexit",
+            ],
+            "windows": [],
+            "darwin": [],
+            "linux": [],
+        },
+        "ffprobe": {
+            "base_args": [
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
+            ],
+             "windows": [],
+            "darwin": [],
+            "linux": [],
+        }
+    }
 
     def __init__(self):
-        # Simplified settings: default to ffplay, but try mpv if ffplay is not found.
         self.current_os = platform.system().lower()
-        self.preferred_player = "ffplay" # Default to ffplay
 
-    def get_player_executable(self, player_type=None):
+    def get_player_executable(self, player_type):
         """Gets the appropriate executable name for the current platform."""
-        if player_type is None:
-            player_type = self.preferred_player
-
         if self.current_os == "windows":
-            if player_type == "mpv":
-                # Try both mpv.exe and mpvnet.exe on Windows
-                for exe_name in ["mpvnet.exe", "mpv.exe"]:
-                    if shutil.which(exe_name):
-                        return exe_name
-                return "mpv.exe"  # Default fallback
-            else:
-                return "ffplay.exe"
+            return f"{player_type}.exe"
         else:
-            # Linux, macOS, and other Unix-like systems
-            if player_type == "mpv":
-                return "mpv"
-            else:
-                return "ffplay"
+            return player_type
 
     def check_player_availability(self, player_type):
         """Checks if a media player is available on the system."""
@@ -47,40 +64,85 @@ class MediaPlayerManager:
         return shutil.which(executable) is not None
 
     def get_player_command(self, stream_url, player_type, referer_url=None):
-        """Generate the appropriate command line for playing a stream"""
+        """Generate the appropriate command line for playing a stream."""
         executable = self.get_player_executable(player_type)
         user_agent = "VLC/3.0.18"
 
+        config = self.PLAYER_CONFIG.get(player_type, {})
+        command = [executable] + config.get("base_args", [])
+
+        platform_args = config.get(self.current_os, [])
+        if platform_args:
+            command.extend(platform_args)
+
         if player_type == "mpv":
-            command = [
-                executable,
-                "--no-config",
-                "--ytdl=no",
-                "--fs",
-                "--keep-open=no",
-            ]
             headers = [f"User-Agent: {user_agent}"]
             if referer_url:
                 headers.append(f"Referer: {referer_url}")
-
             command.append(f"--http-header-fields={','.join(headers)}")
-
-            if self.current_os == "windows":
-                command.append("--ao=wasapi")
-
-            command.append(stream_url)
-            return command
-        else:  # ffplay
-            headers = f"User-Agent: {user_agent}\r\n"
+        elif player_type in ["ffplay", "ffprobe"]:
+            headers = f"User-Agent: {user_agent}\\r\\n"
             if referer_url:
-                headers += f"Referer: {referer_url}\r\n"
-            return [executable, "-headers", headers, "-fs", "-noborder", "-autoexit", stream_url]
+                headers += f"Referer: {referer_url}\\r\\n"
+            command.extend(["-headers", headers])
+
+        command.append(stream_url)
+        return command
+
+    def get_stream_info(self, stream_url, referer_url=None):
+        """
+        Uses ffprobe to get codec and format information for a stream.
+        """
+        if not self.check_player_availability("ffprobe"):
+            logging.warning("ffprobe is not available, cannot get stream info.")
+            return None
+
+        command = self.get_player_command(stream_url, "ffprobe", referer_url)
+
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=15)
+            return json.loads(result.stdout)
+        except FileNotFoundError:
+            logging.error("ffprobe executable not found, though check passed. This is unexpected.")
+            return None
+        except subprocess.TimeoutExpired:
+            logging.error(f"ffprobe timed out analyzing stream: {stream_url}")
+            return None
+        except subprocess.CalledProcessError as e:
+            logging.error(f"ffprobe failed with exit code {e.returncode} for stream: {stream_url}")
+            logging.error(f"ffprobe stderr: {e.stderr}")
+            return None
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to decode JSON from ffprobe output: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"An unexpected error occurred while running ffprobe: {e}")
+            return None
 
     def play_stream(self, stream_url, parent_widget=None, referer_url=None):
         """
-        Play a stream URL using the best available media player.
-        It first tries mpv, then falls back to ffplay.
+        Analyzes and plays a stream URL using the best available media player.
         """
+        # 1. Analyze the stream
+        logging.info(f"Attempting to play stream: {stream_url}")
+        stream_info = self.get_stream_info(stream_url, referer_url)
+
+        if stream_info:
+            logging.info(f"Stream analysis successful for: {stream_url}")
+            # Log format information
+            if 'format' in stream_info:
+                format_info = stream_info['format']
+                logging.info(f"  Format: {format_info.get('format_long_name', 'N/A')}")
+            # Log codec information for each stream
+            if 'streams' in stream_info:
+                for stream in stream_info['streams']:
+                    codec_type = stream.get('codec_type', 'unknown')
+                    codec_name = stream.get('codec_long_name', 'N/A')
+                    logging.info(f"  - {codec_type.capitalize()} stream: {codec_name}")
+        else:
+            logging.warning(f"Could not analyze stream, proceeding with playback attempt: {stream_url}")
+
+        # 2. Select player and play
         player_to_use = None
         if self.check_player_availability("mpv"):
             player_to_use = "mpv"
@@ -93,11 +155,10 @@ class MediaPlayerManager:
         command = self.get_player_command(stream_url, player_to_use, referer_url)
 
         try:
-            # Using Popen to run in a non-blocking way
             subprocess.Popen(command)
+            logging.info(f"Launched {player_to_use} with command: {' '.join(command)}")
             return True
         except FileNotFoundError:
-            # This case should be rare since we check availability first
             self._show_player_not_found_error(parent_widget)
             return False
         except Exception as e:
@@ -105,28 +166,13 @@ class MediaPlayerManager:
             return False
 
     def _show_player_not_found_error(self, parent_widget):
-        """Show error message when no supported player is found"""
+        """Show error message when no supported player is found."""
         error_msg = "No compatible media player found (FFplay or MPV).\\n\\n"
-        error_msg += "Please ensure either FFplay (part of FFmpeg) or MPV is installed and available in your system's PATH.\\n\\n"
-
-        if self.current_os == "windows":
-            error_msg += "For FFmpeg on Windows:\\n"
-            error_msg += "• Download from https://ffmpeg.org/download.html\\n"
-            error_msg += "• Add the 'bin' directory to your system PATH\\n\\n"
-            error_msg += "For MPV on Windows:\\n"
-            error_msg += "• Download from https://mpv.io/installation/\\n"
-        else:
-            error_msg += "For FFmpeg on Linux/macOS:\\n"
-            error_msg += "• Ubuntu/Debian: sudo apt install ffmpeg\\n"
-            error_msg += "• macOS: brew install ffmpeg\\n\\n"
-            error_msg += "For MPV on Linux/macOS:\\n"
-            error_msg += "• Ubuntu/Debian: sudo apt install mpv\\n"
-            error_msg += "• macOS: brew install mpv\\n"
-
+        error_msg += "Please ensure either FFplay (part of FFmpeg) or MPV is installed and available in your system's PATH."
         QMessageBox.critical(parent_widget, "Media Player Error", error_msg)
 
     def _show_playback_error(self, error_message, parent_widget):
-        """Show generic playback error"""
+        """Show generic playback error."""
         QMessageBox.critical(
             parent_widget,
             "Playback Error",

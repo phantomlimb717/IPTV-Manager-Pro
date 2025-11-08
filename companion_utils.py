@@ -57,8 +57,8 @@ class MediaPlayerManager:
                 # MPV on Windows with WASAPI audio output
                 return [executable, "--user-agent=" + user_agent, "--fs", "--keep-open=no", "--ao=wasapi", stream_url]
             else:
-                # For Linux/macOS, pass user-agent as two separate arguments and let mpv choose the audio output.
-                return [executable, "--user-agent", user_agent, "--fs", "--keep-open=no", stream_url]
+                # MPV on Linux/macOS, use --user-agent=value format and let mpv auto-select the audio driver.
+                return [executable, "--user-agent=" + user_agent, "--fs", "--keep-open=no", stream_url]
         else:  # ffplay
             # FFplay command line arguments
             return [executable, "-user_agent", user_agent, "-fs", "-noborder", "-autoexit", stream_url]

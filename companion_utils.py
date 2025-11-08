@@ -46,24 +46,37 @@ class MediaPlayerManager:
         executable = self.get_player_executable(player_type)
         return shutil.which(executable) is not None
 
-    def get_player_command(self, stream_url, player_type):
+    def get_player_command(self, stream_url, player_type, referer_url=None):
         """Generate the appropriate command line for playing a stream"""
         executable = self.get_player_executable(player_type)
-        # Using a common User-Agent can help with servers that block default ffplay/ffmpeg/mpv agents.
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+        user_agent = "VLC/3.0.18"
 
         if player_type == "mpv":
-            if self.current_os == "windows":
-                # MPV on Windows with WASAPI audio output
-                return [executable, "--user-agent=" + user_agent, "--fs", "--keep-open=no", "--ao=wasapi", stream_url]
-            else:
-                # MPV on Linux/macOS with PulseAudio/ALSA fallback
-                return [executable, "--user-agent=" + user_agent, "--fs", "--keep-open=no", stream_url]
-        else:  # ffplay
-            # FFplay command line arguments
-            return [executable, "-user_agent", user_agent, "-fs", "-noborder", "-autoexit", stream_url]
+            command = [
+                executable,
+                "--no-config",
+                "--ytdl=no",
+                "--fs",
+                "--keep-open=no",
+            ]
+            headers = [f"User-Agent: {user_agent}"]
+            if referer_url:
+                headers.append(f"Referer: {referer_url}")
 
-    def play_stream(self, stream_url, parent_widget=None):
+            command.append(f"--http-header-fields={','.join(headers)}")
+
+            if self.current_os == "windows":
+                command.append("--ao=wasapi")
+
+            command.append(stream_url)
+            return command
+        else:  # ffplay
+            headers = f"User-Agent: {user_agent}\r\n"
+            if referer_url:
+                headers += f"Referer: {referer_url}\r\n"
+            return [executable, "-headers", headers, "-fs", "-noborder", "-autoexit", stream_url]
+
+    def play_stream(self, stream_url, parent_widget=None, referer_url=None):
         """
         Play a stream URL using the best available media player.
         It first tries mpv, then falls back to ffplay.
@@ -77,7 +90,7 @@ class MediaPlayerManager:
             self._show_player_not_found_error(parent_widget)
             return False
 
-        command = self.get_player_command(stream_url, player_to_use)
+        command = self.get_player_command(stream_url, player_to_use, referer_url)
 
         try:
             # Using Popen to run in a non-blocking way

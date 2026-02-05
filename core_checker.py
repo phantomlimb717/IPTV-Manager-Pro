@@ -19,7 +19,7 @@ class IPTVChecker:
     Core checking logic for IPTV credentials.
     Implements a two-tier verification strategy:
     1. API Credential Check (Fast)
-    2. Stream Connectivity Check (Slower, but verifies playback)
+    2. Stream Connectivity Check (Disabled by default to avoid false negatives)
     """
 
     def __init__(self):
@@ -80,11 +80,18 @@ class IPTVChecker:
             # Merge API results
             result.update(api_result)
 
-            # --- Tier 2: Stream Verification (Only if API checks out Active) ---
-            # If API is valid/active, we proceed to verify if streams actually work.
-            # Some providers have valid APIs but dead streams.
+            # --- Tier 2: Stream Verification (Skipped) ---
+            # User Feedback: "Stream Error" labels are often false negatives.
+            # We now rely solely on the API credential status.
             if result.get('success') and result.get('api_status') == 'Active':
-                 # Only perform stream check for XC currently as Stalker stream extraction is complex
+                 # result['api_message'] = "Active & Verified"
+                 # We simply keep the message from Tier 1 or set a default if missing
+                 if not result.get('api_message'):
+                     result['api_message'] = "Active"
+
+                 # NOTE: The stream verification code below is deliberately disabled.
+                 # It is preserved in the class methods for potential future manual checks.
+                 """
                  if account_type == 'xc':
                     stream_status = await self.verify_stream_connectivity(
                         entry_data.get('server_base_url'),
@@ -96,7 +103,8 @@ class IPTVChecker:
                         result['api_status'] = 'Active (Stream Error)'
                         result['api_message'] = f"API OK, but stream check failed: {stream_status['message']}"
                     else:
-                        result['api_message'] = "Active & Verified" # Stronger confirmation
+                        result['api_message'] = "Active & Verified"
+                 """
 
         except Exception as e:
             logging.error(f"Unexpected error checking entry: {e}")

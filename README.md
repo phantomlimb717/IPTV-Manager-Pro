@@ -13,7 +13,12 @@ A desktop application for managing and checking the status of IPTV account crede
 - **Batch Import:** Import multiple accounts from a text file. Supports:
     - Xtream Codes API `get.php` style URLs.
     - Stalker Portal credentials in the formats listed below.
-- **Status Checking:** Check account status (including expiry date, active/max connections for Xtream Codes API) for both Xtream Codes and Stalker Portal type accounts.
+- **Advanced Status Checking (Modernized):**
+    - **High-Performance Async Engine:** Checks hundreds of accounts rapidly without freezing the UI.
+    - **Two-Tier Verification:**
+        1.  **API Check:** Verifies credentials against the server's API.
+        2.  **Stream Check:** If the API is valid, it attempts to verify that a live stream is actually playable (via high-speed download test or FFmpeg fallback).
+    - **Smart Backoff Strategy:** Accounts that fail checks are automatically "frozen" for increasing periods (1 min, 2 min, 4 min...) to prevent IP bans and waste resources. Frozen accounts are skipped during bulk checks.
 - **Integrated Playlist Browser:** Double-click an active Xtream Codes account to browse and play Live, Movie, and Series content directly through an external media player (FFplay or MPV).
 - **Categorization:** Organize your entries into custom categories.
 - **Advanced Filtering:** Quickly search the list by any field and filter by category.
@@ -49,7 +54,8 @@ No installation is required. Simply download the `IPTV_Manager_Pro.exe` file and
             http://another-portal.com
             00:1A:79:YY:YY:YA
             ```
-4.  Select accounts and use the `Check Selected` or `Check All Visible` buttons to refresh their status from the provider's API (*note*: `Check All Visible` will take a while if you have many playlists).
+4.  Select accounts and use the `Check Selected` or `Check All Visible` buttons to refresh their status.
+    *   **Note on "Frozen" Accounts:** If an account repeatedly fails, you may see a status like "Skipped (Frozen until...)". This is normal and protects your IP address. To force a check, you can delete and re-add the entry, or simply wait for the timer to expire.
 5.  **Browse & Play:** For an active Xtream Codes account, double-click the entry to open the new Playlist Browser. From there, you can browse and play all available Live, Movie, and Series content.
 6.  Use "Copy Link (Current)" or "Export Links (Selected)" to get account data:
     *   For Xtream Codes API entries, this will be the M3U playable link.

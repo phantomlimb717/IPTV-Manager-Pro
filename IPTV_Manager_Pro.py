@@ -12,6 +12,7 @@ from typing import Optional # Added for type hinting
 # import html # Not currently used
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone, timedelta
+import asyncio
 
 # --- Dependency Check & Imports ---
 try:
@@ -47,6 +48,7 @@ except ImportError:
     sys.exit(1)
 
 from companion_utils import MediaPlayerManager
+from core_checker import IPTVChecker
 
 # --- Resource Path Helper for PyInstaller ---
 def resource_path(relative_path):
@@ -126,7 +128,9 @@ def initialize_database():
                 raw_server_info TEXT,
                 account_type TEXT DEFAULT 'xc',
                 mac_address TEXT,
-                portal_url TEXT
+                portal_url TEXT,
+                bad_count INTEGER DEFAULT 0,
+                frozen_until REAL DEFAULT 0
             )
         ''')
         # Add new columns if they don't exist (for existing databases)
@@ -162,6 +166,17 @@ def initialize_database():
         except sqlite3.OperationalError:
             logging.info("Adding 'series_count' column to entries table.")
             cursor.execute("ALTER TABLE entries ADD COLUMN series_count INTEGER")
+
+        try:
+            cursor.execute("SELECT bad_count FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'bad_count' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN bad_count INTEGER DEFAULT 0")
+        try:
+            cursor.execute("SELECT frozen_until FROM entries LIMIT 1")
+        except sqlite3.OperationalError:
+            logging.info("Adding 'frozen_until' column to entries table.")
+            cursor.execute("ALTER TABLE entries ADD COLUMN frozen_until REAL DEFAULT 0")
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
@@ -247,21 +262,37 @@ def update_entry_status(entry_id, status_data):
     conn = get_db_connection()
     try:
         current_time_iso = datetime.now(timezone.utc).isoformat()
-        conn.execute('''
-            UPDATE entries
-            SET last_checked_at = ?, api_status = ?, api_message = ?,
-                expiry_date_ts = ?, is_trial = ?, active_connections = ?,
-                max_connections = ?, raw_user_info = ?, raw_server_info = ?,
-                live_streams_count = ?, movies_count = ?, series_count = ?
-            WHERE id = ?
-        ''', (
+
+        # Prepare params, handling the optional new fields
+        params = [
             current_time_iso, status_data.get('api_status'), status_data.get('api_message'),
             status_data.get('expiry_date_ts'), status_data.get('is_trial'),
             status_data.get('active_connections'), status_data.get('max_connections'),
             status_data.get('raw_user_info'), status_data.get('raw_server_info'),
             status_data.get('live_streams_count'), status_data.get('movies_count'),
-            status_data.get('series_count'), entry_id
-        ))
+            status_data.get('series_count')
+        ]
+
+        query = '''
+            UPDATE entries
+            SET last_checked_at = ?, api_status = ?, api_message = ?,
+                expiry_date_ts = ?, is_trial = ?, active_connections = ?,
+                max_connections = ?, raw_user_info = ?, raw_server_info = ?,
+                live_streams_count = ?, movies_count = ?, series_count = ?
+        '''
+
+        # Add frozen/bad_count updates if present
+        if 'bad_count' in status_data:
+            query += ", bad_count = ?"
+            params.append(status_data['bad_count'])
+        if 'frozen_until' in status_data:
+            query += ", frozen_until = ?"
+            params.append(status_data['frozen_until'])
+
+        query += " WHERE id = ?"
+        params.append(entry_id)
+
+        conn.execute(query, params)
         conn.commit()
         logging.info(f"Updated status for entry ID: {entry_id} to {status_data.get('api_status')}")
     except Exception as e: logging.error(f"Failed to update status for entry ID {entry_id}: {e}")
@@ -352,354 +383,6 @@ def format_timestamp_display(unix_timestamp_utc):
 def format_trial_status_display(is_trial):
     if is_trial is None: return "N/A"
     return "Yes" if str(is_trial) == '1' else "No"
-
-def get_stream_counts(server_base_url, username, password, session):
-    counts = {'live': None, 'movie': None, 'series': None}
-    action_map = {'live': 'get_live_streams', 'movie': 'get_vod_streams', 'series': 'get_series'}
-    for cat_type, action in action_map.items():
-        api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action={action}"
-        try:
-            response = session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
-            response.raise_for_status()
-            data = response.json()
-            if isinstance(data, list):
-                counts[cat_type] = len(data)
-        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-            logging.warning(f"Could not fetch {cat_type} streams: {e}")
-    return counts
-
-def check_account_status_detailed_api(server_base_url, username, password, session):
-    processed_data = {
-        'success': False, 'api_status': None, 'api_message': "Check init error",
-        'expiry_date_ts': None, 'is_trial': None, 'active_connections': None,
-        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None,
-        'live_streams_count': None, 'movies_count': None, 'series_count': None
-    }
-    # Session should be initialized before this is called in a loop.
-    if not all([server_base_url, username is not None, session]):
-        processed_data['api_message'] = "Internal Error: Missing parameters for API call"
-        return processed_data
-
-    try:
-        parsed_base = urlparse(server_base_url)
-        if not parsed_base.scheme or not parsed_base.netloc:
-            raise ValueError("Invalid server_base_url format")
-        api_url = f"{server_base_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_user_info"
-    except Exception as url_e:
-        processed_data['api_message'] = f"Invalid Server URL: {url_e}"
-        return processed_data
-
-    logging.info(f"API Check: {parsed_base.scheme}://{parsed_base.netloc}/... (User: {username})")
-    response_text = None
-    try:
-        response = session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
-        response_text = response.text
-        response.raise_for_status()
-        data = response.json()
-
-        processed_data['raw_user_info'] = json.dumps(data.get('user_info')) if data.get('user_info') is not None else None
-        processed_data['raw_server_info'] = json.dumps(data.get('server_info')) if data.get('server_info') is not None else None
-        user_info = data.get('user_info', {})
-
-        if not isinstance(user_info, dict):
-            processed_data['api_message'] = "Invalid 'user_info' format"
-            processed_data['success'] = False
-            return processed_data
-
-        auth_status = get_safe_api_value(user_info, 'auth')
-        if auth_status == 0 or str(auth_status) == '0':
-            processed_data['api_message'] = "Authentication Failed (auth: 0)"
-            processed_data['api_status'] = "Auth Failed"
-            processed_data['success'] = False
-            return processed_data
-
-        current_api_msg = ""
-        if 'status' not in user_info:
-            if not user_info:
-                current_api_msg = "'user_info' object empty and missing 'status'"
-            else:
-                current_api_msg = "'user_info' missing 'status' field"
-            processed_data['api_status'] = 'Unknown'
-
-        processed_data['success'] = True
-        api_status_val = get_safe_api_value(user_info, 'status')
-        if api_status_val is not None:
-             processed_data['api_status'] = api_status_val
-
-        user_info_message = get_safe_api_value(user_info, 'message', '')
-        if user_info_message:
-             processed_data['api_message'] = f"{current_api_msg} {user_info_message}".strip() if current_api_msg else user_info_message
-        elif current_api_msg:
-             processed_data['api_message'] = current_api_msg
-        else:
-             processed_data['api_message'] = ''
-
-        exp_date_raw = get_safe_api_value(user_info, 'exp_date')
-        if exp_date_raw is not None:
-            try:
-                exp_ts = int(exp_date_raw)
-                processed_data['expiry_date_ts'] = exp_ts if exp_ts > 0 else None
-            except (ValueError, TypeError):
-                logging.warning(f"API Check {username}: Invalid exp_date format '{exp_date_raw}'")
-                pass
-
-        is_trial_raw = get_safe_api_value(user_info, 'is_trial')
-        if is_trial_raw is not None:
-            try:
-                processed_data['is_trial'] = int(is_trial_raw)
-            except (ValueError, TypeError):
-                logging.warning(f"API Check {username}: Invalid is_trial format '{is_trial_raw}'")
-                pass
-
-        active_c_raw = get_safe_api_value(user_info, 'active_cons')
-        if active_c_raw is not None:
-            try:
-                processed_data['active_connections'] = int(active_c_raw)
-            except (ValueError, TypeError):
-                logging.warning(f"API Check {username}: Invalid active_cons format '{active_c_raw}'")
-                pass
-
-        max_c_raw = get_safe_api_value(user_info, 'max_connections')
-        if max_c_raw is not None:
-            try:
-                processed_data['max_connections'] = int(max_c_raw)
-            except (ValueError, TypeError):
-                logging.warning(f"API Check {username}: Invalid max_connections format '{max_c_raw}'")
-                pass
-
-        if processed_data['success'] and processed_data['api_status'] in [None, 'Unknown'] and not processed_data['api_message']:
-            processed_data['api_message'] = "Valid connection but key data missing from API."
-
-        if processed_data['success']:
-            stream_counts = get_stream_counts(server_base_url, username, password, session)
-            processed_data['live_streams_count'] = stream_counts.get('live')
-            processed_data['movies_count'] = stream_counts.get('movie')
-            processed_data['series_count'] = stream_counts.get('series')
-
-        return processed_data
-
-    except requests.exceptions.Timeout:
-        processed_data['api_message'] = f"Request Timeout ({API_TIMEOUT}s)"
-    except requests.exceptions.HTTPError as e:
-        processed_data['api_message'] = f"HTTP Error {e.response.status_code}"
-        if response_text and ('raw_user_info' not in processed_data or not processed_data['raw_user_info']):
-             processed_data['raw_user_info'] = json.dumps({"error_context_response": response_text[:500]})
-    except requests.exceptions.RequestException as e:
-        processed_data['api_message'] = f"Connection Error: {type(e).__name__}"
-    except json.JSONDecodeError:
-        processed_data['api_message'] = "Invalid JSON response"
-        if response_text and ('raw_user_info' not in processed_data or not processed_data['raw_user_info']):
-             processed_data['raw_user_info'] = json.dumps({"non_json_response": response_text[:500]})
-    except Exception as e:
-        processed_data['api_message'] = f"Unexpected API Error: {type(e).__name__}"
-        logging.exception(f"Unexpected error during API check for {username}.")
-
-    processed_data['success'] = False
-    return processed_data
-
-# --- Stalker Portal API Functions ---
-STALKER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
-STALKER_COMMON_HEADERS = {
-    'User-Agent': STALKER_USER_AGENT,
-    'Accept': 'application/json, text/javascript, */*; q=0.01',
-    'X-Requested-With': 'XMLHttpRequest',
-}
-
-def _get_stalker_token(session: requests.Session, portal_url: str, mac_address: str) -> Optional[str]:
-    """Performs handshake and retrieves token for Stalker Portal."""
-    handshake_url = f"{portal_url.rstrip('/')}/portal.php?action=handshake&type=stb&token=&JsHttpRequest=1-xml"
-    headers = {**STALKER_COMMON_HEADERS, 'Authorization': f"MAC {mac_address}"}
-    # Stalker portals often expect the MAC as a cookie as well.
-    # maclist.py seems to use the MAC with colons directly.
-    session.cookies.update({"mac": mac_address})
-    session.headers.update({'Referer': f"{portal_url.rstrip('/')}/c/"})
-
-    logging.info(f"Stalker: Attempting handshake with {portal_url} for MAC {mac_address} (Cookie MAC: {mac_address})")
-    try:
-        response = session.get(handshake_url, headers=headers, timeout=API_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        token = data.get("js", {}).get("token")
-        if token:
-            logging.info(f"Stalker: Handshake successful, token received for MAC {mac_address}")
-            return token
-        else:
-            logging.warning(f"Stalker: Handshake response did not contain token for MAC {mac_address}. Response: {response.text[:200]}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Stalker: Handshake request exception for MAC {mac_address} to {portal_url}: {e}")
-    except json.JSONDecodeError as e:
-        logging.error(f"Stalker: Handshake JSON decode error for MAC {mac_address} to {portal_url}: {e}. Response: {response.text[:200] if 'response' in locals() else 'N/A'}")
-    except KeyError as e:
-        logging.error(f"Stalker: Handshake Key error (likely missing 'js' or 'token') for MAC {mac_address}: {e}. Response: {response.text[:200] if 'response' in locals() else 'N/A'}")
-    return None
-
-def check_stalker_portal_status(portal_url: str, mac_address: str, session: requests.Session):
-    processed_data = {
-        'success': False, 'api_status': "Error", 'api_message': "Check init error (Stalker)",
-        'expiry_date_ts': None, 'is_trial': None, 'active_connections': None, # Stalker might not provide these
-        'max_connections': None, 'raw_user_info': None, 'raw_server_info': None # server_info not typical for Stalker
-    }
-
-    if not all([portal_url, mac_address, session]):
-        processed_data['api_message'] = "Internal Error: Missing parameters for Stalker API call"
-        return processed_data
-
-    # Ensure MAC address is in the common format for headers/cookies if needed
-    formatted_mac = mac_address.upper() # For Authorization header
-    # cookie_mac = mac_address.replace(":", "").lower() # Example for cookie, if portal expects it specifically
-
-    token = _get_stalker_token(session, portal_url, formatted_mac)
-
-    if not token:
-        processed_data['api_message'] = "Stalker Handshake Failed: Could not get token."
-        # Log already done in _get_stalker_token
-        return processed_data
-
-    account_info_url = f"{portal_url.rstrip('/')}/portal.php?type=account_info&action=get_main_info&JsHttpRequest=1-xml"
-    headers = {**STALKER_COMMON_HEADERS, 'Authorization': f"Bearer {token}"}
-    # Referer is typically set on the session already by _get_stalker_token
-
-    logging.info(f"Stalker: Getting account info from {portal_url} for MAC {formatted_mac}")
-    response_text = None
-    try:
-        response = session.get(account_info_url, headers=headers, timeout=API_TIMEOUT)
-        response_text = response.text
-        response.raise_for_status()
-        data = response.json()
-        user_info = data.get("js", {})
-
-        processed_data['raw_user_info'] = json.dumps(user_info)
-
-        if not isinstance(user_info, dict):
-            processed_data['api_message'] = "Invalid 'user_info' format (Stalker)"
-            processed_data['success'] = False
-            return processed_data
-
-        # Stalker portals use various fields for status and expiry.
-        # Common ones include 'status', 'exp_date' (unix timestamp or string), or sometimes in 'data' sub-object.
-        # The `maclist.py` example used `phone` for expiry, which is unusual. Let's be flexible.
-
-        # Infer status:
-        # A common pattern is status=1 means active, status=0 or 2 might mean inactive/expired.
-        # If 'status' field exists and is 0 or 2, it's likely not active.
-        # If 'exp_date' is in the past, it's expired.
-
-        api_status_val = user_info.get('status')
-        if api_status_val is not None:
-            api_status_str = str(api_status_val).lower()
-            if api_status_str == '1':
-                processed_data['api_status'] = "Active"
-            elif api_status_str == '0' or api_status_str == '2':
-                 processed_data['api_status'] = "Inactive/Disabled" # More specific than just "Expired"
-            else:
-                processed_data['api_status'] = f"Status: {api_status_val}"
-        else:
-            # If no explicit status, we'll rely on expiry date or assume active if expiry is future/valid.
-            processed_data['api_status'] = "Info Retrieved" # Placeholder, will be updated by expiry logic
-
-        # Expiry Date Handling:
-        # Stalker portals can have 'exp_date' as a unix timestamp or a string 'YYYY-MM-DD HH:MM:SS' or 'DD.MM.YYYY'.
-        # The example `maclist.py` used 'phone' for expiry.
-        exp_date_raw = user_info.get('exp_date') # Primary target
-        if exp_date_raw is None:
-            exp_date_raw = user_info.get('expire_date') # Secondary common target
-
-        source_of_date = "exp_date/expire_date"
-
-        if exp_date_raw is None and 'phone' in user_info: # Check 'phone' only if others failed
-            exp_date_raw = user_info.get('phone')
-            source_of_date = "phone"
-            logging.info(f"Stalker: Trying to parse expiry from 'phone' field for MAC {formatted_mac}: '{exp_date_raw}'")
-
-
-        if exp_date_raw is not None:
-            try:
-                # Attempt to parse as Unix timestamp first
-                exp_ts = int(float(exp_date_raw))
-                if exp_ts > 0:
-                    processed_data['expiry_date_ts'] = exp_ts
-                    logging.info(f"Stalker: Parsed expiry for MAC {formatted_mac} as UNIX timestamp: {exp_ts} from '{source_of_date}' field.")
-            except (ValueError, TypeError):
-                # Attempt to parse as string date
-                if isinstance(exp_date_raw, str):
-                    dt_obj = None
-                    parsed_format_msg = ""
-                    try:
-                        # Try "Month Day, Year, HH:MM am/pm" format (e.g., "August 17, 2025, 12:00 am")
-                        dt_obj = datetime.strptime(exp_date_raw, '%B %d, %Y, %I:%M %p')
-                        parsed_format_msg = "%B %d, %Y, %I:%M %p"
-                    except ValueError:
-                        try:
-                            # Try "YYYY-MM-DD HH:MM:SS"
-                            dt_obj = datetime.strptime(exp_date_raw, '%Y-%m-%d %H:%M:%S')
-                            parsed_format_msg = "%Y-%m-%d %H:%M:%S"
-                        except ValueError:
-                            try:
-                                # Try "DD.MM.YYYY"
-                                dt_obj = datetime.strptime(exp_date_raw, '%d.%m.%Y')
-                                parsed_format_msg = "%d.%m.%Y"
-                            except ValueError:
-                                # Add more formats if needed
-                                pass # dt_obj remains None
-
-                    if dt_obj:
-                        # Assume parsed naive datetime is in UTC as server times often are.
-                        # If it were local, timezone conversion would be needed if TZ known.
-                        processed_data['expiry_date_ts'] = int(dt_obj.replace(tzinfo=timezone.utc).timestamp())
-                        logging.info(f"Stalker: Parsed expiry for MAC {formatted_mac} from string '{exp_date_raw}' (format '{parsed_format_msg}') to TS: {processed_data['expiry_date_ts']} from '{source_of_date}' field.")
-                        if source_of_date == "phone" and (not processed_data['api_message'] or processed_data['api_message'] == "Check init error (Stalker)"):
-                             processed_data['api_message'] = f"Expiry from 'phone': {exp_date_raw}"
-
-                    else:
-                        logging.warning(f"Stalker: Unparseable string exp_date '{exp_date_raw}' for MAC {formatted_mac} from '{source_of_date}'.")
-                        if not processed_data['api_message'] or processed_data['api_message'] == "Check init error (Stalker)" or "format unknown" not in processed_data['api_message'] :
-                             processed_data['api_message'] = f"Expiry date format unknown: {str(exp_date_raw)[:30]}"
-                else:
-                    logging.warning(f"Stalker: Invalid (non-string, non-numeric) exp_date format '{exp_date_raw}' for MAC {formatted_mac} from '{source_of_date}'.")
-
-        # Update status based on expiry
-        if processed_data['expiry_date_ts'] is not None:
-            if processed_data['expiry_date_ts'] < datetime.now(timezone.utc).timestamp():
-                processed_data['api_status'] = "Expired"
-            elif processed_data['api_status'] == "Info Retrieved": # Only if not explicitly inactive
-                 processed_data['api_status'] = "Active"
-        elif processed_data['api_status'] == "Info Retrieved": # No expiry, no explicit status
-            processed_data['api_status'] = "Unknown" # Or "Active (No Expiry)"
-
-        # Stalker portals usually don't provide trial, active_cons, max_cons in get_main_info
-        # These will remain None unless specific portals are found to provide them.
-        # is_trial, active_connections, max_connections remain as their defaults (None)
-
-        processed_data['success'] = True
-        if not processed_data.get('api_message') or processed_data['api_message'] == "Check init error (Stalker)":
-            processed_data['api_message'] = user_info.get('message', "Status successfully retrieved.") # Some portals might have a message field
-        if not processed_data['api_message'] and processed_data['success']:
-             processed_data['api_message'] = "OK"
-
-
-        return processed_data
-
-    except requests.exceptions.Timeout:
-        processed_data['api_message'] = f"Request Timeout ({API_TIMEOUT}s) (Stalker)"
-        logging.warning(f"Stalker: Timeout for MAC {formatted_mac} at {portal_url}")
-    except requests.exceptions.HTTPError as e:
-        processed_data['api_message'] = f"HTTP Error {e.response.status_code} (Stalker)"
-        if response_text: processed_data['raw_user_info'] = json.dumps({"error_context_response": response_text[:500]})
-        logging.warning(f"Stalker: HTTP Error {e.response.status_code} for MAC {formatted_mac} at {portal_url}. Response: {response_text[:200] if response_text else 'N/A'}")
-    except requests.exceptions.RequestException as e:
-        processed_data['api_message'] = f"Connection Error (Stalker): {type(e).__name__}"
-        logging.warning(f"Stalker: Connection Error for MAC {formatted_mac} at {portal_url}: {e}")
-    except json.JSONDecodeError:
-        processed_data['api_message'] = "Invalid JSON response (Stalker)"
-        if response_text: processed_data['raw_user_info'] = json.dumps({"non_json_response": response_text[:500]})
-        logging.warning(f"Stalker: JSON Decode Error for MAC {formatted_mac} at {portal_url}. Response: {response_text[:200] if response_text else 'N/A'}")
-    except Exception as e:
-        processed_data['api_message'] = f"Unexpected API Error (Stalker): {type(e).__name__}"
-        logging.exception(f"Stalker: Unexpected error during API check for MAC {formatted_mac} at {portal_url}.")
-
-    processed_data['success'] = False
-    return processed_data
 
 
 # =============================================================================
@@ -1178,7 +861,7 @@ class PlaylistFilterProxyModel(QSortFilterProxyModel):
     def set_search_text(self, text):
         """Splits the search text into terms and triggers a filter update."""
         self._search_terms = text.lower().split()
-        self.invalidateFilter()
+        self.invalidate()
 
     def filterAcceptsRow(self, source_row, source_parent):
         """
@@ -1523,30 +1206,21 @@ class ApiCheckerWorker(QObject):
 
     def __init__(self):
         super().__init__()
-        self._session = None
+        self.checker = None
         self._is_running = True
 
     @Slot()
     def initialize_session(self):
-        if not self._session:
-            try:
-                logging.info("API Worker: Initializing session with retries...")
-                self._session = requests.Session()
-                retry_strategy = Retry(
-                    total=3,
-                    backoff_factor=1,
-                    status_forcelist=[429, 500, 502, 503, 504],
-                    allowed_methods=["HEAD", "GET", "OPTIONS"]
-                )
-                adapter = HTTPAdapter(max_retries=retry_strategy)
-                self._session.mount("http://", adapter)
-                self._session.mount("https://", adapter)
-                logging.info("API Worker: Session initialized.")
-                self.session_initialized_signal.emit()
-            except Exception as e:
-                logging.error(f"API Worker: Failed to initialize session: {e}")
-                self.status_message_updated.emit("Error: Could not initialize network session.")
-                self._is_running = False
+        # Renamed logic but kept name for compatibility if needed, though we update caller
+        try:
+            logging.info("API Worker: Initializing Async Checker...")
+            self.checker = IPTVChecker()
+            logging.info("API Worker: Async Checker initialized.")
+            self.session_initialized_signal.emit()
+        except Exception as e:
+            logging.error(f"API Worker: Failed to initialize checker: {e}")
+            self.status_message_updated.emit("Error: Could not initialize checker.")
+            self._is_running = False
 
     @Slot()
     def stop_processing(self):
@@ -1554,91 +1228,105 @@ class ApiCheckerWorker(QObject):
         logging.info("API Worker: Stop requested.")
 
     def run_checks(self, entry_ids_to_check):
-        # Session initialization is now typically called before run_checks
-        # or we wait for session_initialized_signal if initialize_session is called by thread.started
-        if not self._session:
-            # This case should ideally be handled by waiting for session_initialized_signal
-            # if initialize_session() is called asynchronously.
-            # For now, if called directly, ensure session is initialized.
+        if not self.checker:
             self.initialize_session()
-            if not self._session: # If initialization failed
-                self.batch_finished.emit() # End the batch if session is not up
-                return
 
         self._is_running = True
-        total = len(entry_ids_to_check)
+        try:
+            asyncio.run(self.run_async_checks(entry_ids_to_check))
+        except Exception as e:
+            logging.error(f"Fatal error in async check loop: {e}")
+        finally:
+            self.batch_finished.emit()
+
+    async def run_async_checks(self, entry_ids):
+        total = len(entry_ids)
         processed_count = 0
-        logging.info(f"Worker checking {total} entries.")
-        # Emit initial progress immediately AFTER session is confirmed to be ready.
-        # If initialize_session is called by thread.started, this emit should be after session_initialized_signal is received.
-        # For this direct call structure, it's okay here if initialize_session() is blocking and successful.
         self.progress_updated.emit(0, total)
 
-        for i, entry_id in enumerate(entry_ids_to_check):
-            if not self._is_running:
-                self.progress_updated.emit(processed_count, total) # Emit final processed count
-                self.status_message_updated.emit(f"API checking cancelled after {processed_count}/{total}.")
-                logging.info("API check cancelled by flag.")
-                break
+        try:
+            for entry_id in entry_ids:
+                if not self._is_running:
+                    self.status_message_updated.emit("Stopping...")
+                    break
 
-            # This message is good.
-            # self.status_message_updated.emit(f"Checking {i+1}/{total} (ID: {entry_id})...")
-            try:
-                entry_data = get_entry_by_id(entry_id)
-                if not entry_data:
-                    logging.warning(f"Worker: Entry ID {entry_id} not found.")
-                    self.result_ready.emit(entry_id, {'success': False, 'api_message': "Entry not found in DB"})
+                try:
+                    entry = get_entry_by_id(entry_id)
+                    if not entry:
+                        logging.warning(f"Worker: Entry ID {entry_id} not found.")
+                        processed_count += 1
+                        self.progress_updated.emit(processed_count, total)
+                        continue
+
+                    # Check Frozen Status
+                    frozen_until = entry['frozen_until'] or 0
+                    if time.time() < frozen_until:
+                        # Skip check
+                        frozen_dt = datetime.fromtimestamp(frozen_until).strftime('%H:%M:%S')
+                        msg = f"Skipped (Frozen until {frozen_dt})"
+                        # We send a result to update the UI status column but mostly to show skipping
+                        self.result_ready.emit(entry_id, {
+                            'api_status': 'Frozen',
+                            'api_message': msg,
+                            # Persist existing values
+                            'bad_count': entry['bad_count'],
+                            'frozen_until': entry['frozen_until']
+                        })
+                        processed_count += 1
+                        self.progress_updated.emit(processed_count, total)
+                        continue
+
+                    self.status_message_updated.emit(f"Checking: {entry['name']}...")
+
+                    # Perform Async Check
+                    entry_dict = dict(entry) # Convert Row to Dict
+                    result = await self.checker.check_entry(entry_dict)
+
+                    # Update Backoff Logic
+                    current_bad = entry['bad_count'] or 0
+
+                    if result['success']:
+                        result['bad_count'] = 0
+                        result['frozen_until'] = 0
+                    else:
+                        # If check failed
+                        status_text = str(result.get('api_status', '')).lower()
+
+                        # Criteria for freezing: Auth failure or explicit error.
+                        # Network timeouts might be transient, but repeated ones should freeze.
+                        # For now, let's freeze on any failure that isn't just "Unknown".
+                        new_bad = current_bad + 1
+                        backoff = min(86400, (2 ** new_bad) * 60) # 1m, 2m, 4m, 8m... max 24h
+                        result['bad_count'] = new_bad
+                        result['frozen_until'] = time.time() + backoff
+
+                        if not result.get('api_message'):
+                            result['api_message'] = "Check Failed"
+                        result['api_message'] += f" (Frozen {backoff}s)"
+
+                    self.result_ready.emit(entry_id, result)
+
                     processed_count += 1
                     self.progress_updated.emit(processed_count, total)
-                    continue
 
-                # entry_data is an sqlite3.Row object.
-                account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
-                api_result = None
+                    if REQUEST_DELAY_BETWEEN_CHECKS > 0:
+                        await asyncio.sleep(REQUEST_DELAY_BETWEEN_CHECKS)
 
-                if account_type == 'stalker':
-                    logging.info(f"Worker: Checking Stalker Portal entry ID {entry_id} (MAC: {entry_data['mac_address']})")
-                    api_result = check_stalker_portal_status(
-                        entry_data['portal_url'], # Use the specific portal_url field
-                        entry_data['mac_address'],
-                        self._session
-                    )
-                else: # 'xc' or other unknown types default to XC API check
-                    if account_type != 'xc':
-                        logging.warning(f"Worker: Unknown account type '{account_type}' for entry ID {entry_id}. Defaulting to XC API check.")
-                    logging.info(f"Worker: Checking XC API entry ID {entry_id} (User: {entry_data['username']})")
-                    api_result = check_account_status_detailed_api(
-                        entry_data['server_base_url'],
-                        entry_data['username'],
-                        entry_data['password'],
-                        self._session
-                    )
+                except Exception as e:
+                    logging.error(f"Worker: Error processing entry {entry_id}: {e}")
+                    self.result_ready.emit(entry_id, {'api_status': 'Error', 'api_message': f"Worker Error: {e}"})
+                    processed_count += 1
+                    self.progress_updated.emit(processed_count, total)
 
-                self.result_ready.emit(entry_id, api_result)
-                processed_count += 1
-                if REQUEST_DELAY_BETWEEN_CHECKS > 0:
-                    # This sleep helps the main thread process UI updates for the progress bar
-                    time.sleep(REQUEST_DELAY_BETWEEN_CHECKS)
-            except Exception as e:
-                logging.error(f"Worker: Error checking ID {entry_id}: {e}")
-                self.result_ready.emit(entry_id, {'success': False, 'api_message': f"Worker Error: {e.__class__.__name__}"})
-                processed_count += 1
-            finally:
-                # Update progress after each item attempt
-                self.progress_updated.emit(processed_count, total)
-                logging.debug(f"Worker progress: {processed_count}/{total}")
-
-
-        if self._is_running:
             self.status_message_updated.emit(f"Finished checking {processed_count}/{total} entries.")
-
-        self.batch_finished.emit()
+        finally:
+            # Ensure session is closed so it doesn't persist to a new asyncio loop next time
+            if self.checker:
+                await self.checker.close_session()
 
     def cleanup_session(self):
-        if self._session:
-            self._session.close()
-            self._session = None
-            logging.info("API Worker: Session closed.")
+        # Kept for QThread connection compatibility, though logic is handled in run_async_checks now
+        pass
 
 
 # =============================================================================
@@ -1656,11 +1344,11 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
 
     def set_search_text(self, text):
         self._search_text = text.lower()
-        self.invalidateFilter()
+        self.invalidate()
 
     def set_exclude_na(self, exclude):
         self._exclude_na = exclude
-        self.invalidateFilter()
+        self.invalidate()
 
     def filterAcceptsRow(self, source_row, source_parent):
         search_match = True
@@ -1886,7 +1574,7 @@ class MainWindow(QMainWindow):
         try:
             for row_data in get_all_entries(category_filter=self.current_category_filter): self.table_model.appendRow(self.create_row_items(row_data))
         except Exception as e: logging.error(f"Error loading entries: {e}"); QMessageBox.critical(self, "Load Error", f"Could not load: {e}")
-        self.proxy_model.invalidateFilter()
+        self.proxy_model.invalidate()
 
     def create_row_items(self, entry_data):
         items = []; id_item = QStandardItem(str(entry_data['id'])); id_item.setData(entry_data['id'], Qt.UserRole); items.append(id_item)
@@ -2447,10 +2135,10 @@ class MainWindow(QMainWindow):
                         if col == COL_STATUS: self.apply_status_coloring(existing_item, item_data.text())
                     else:
                         self.table_model.setItem(row, col, item_data)
-                self.proxy_model.invalidateFilter()
+                self.proxy_model.invalidate()
                 return
         logging.warning(f"Could not find row for ID {entry_id} to refresh directly in source model, or it's filtered. Proxy will update.")
-        self.proxy_model.invalidateFilter()
+        self.proxy_model.invalidate()
 
     @Slot()
     def _clear_thread_references(self):

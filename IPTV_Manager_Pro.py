@@ -818,7 +818,7 @@ class StreamLoaderWorker(QObject):
             self.finished.emit()
 
 class SeriesInfoWorker(QObject):
-    data_ready = Signal(dict)
+    data_ready = Signal(object)
     error_occurred = Signal(str)
     finished = Signal()
 
@@ -1139,7 +1139,7 @@ class PlaylistBrowserDialog(QDialog):
         self.series_worker.finished.connect(self.series_worker.deleteLater)
         self.series_info_thread.start()
 
-    @Slot(dict)
+    @Slot(object)
     def on_series_info_ready(self, data):
         try:
             print(f"DEBUG: Series Data: {json.dumps(data, indent=2)}")

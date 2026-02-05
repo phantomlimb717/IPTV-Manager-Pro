@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 USER_AGENT = 'IPTV Manager Pro/0.3 (okhttp/3.12.1)'
 API_TIMEOUT = 10
 DOWNLOAD_TIMEOUT = 10
-FFMPEG_TIMEOUT = 8
+FFMPEG_TIMEOUT = 20  # Increased to allow for longer analysis
 
 class IPTVChecker:
     """
@@ -244,8 +244,9 @@ class IPTVChecker:
             }
 
             # 2. Try Speed Test (Fastest)
+            # Relaxed threshold: > 0.05 MB/s (approx 50KB/s) is enough to show life
             speed_mb = await self.check_download_speed(stream_url, headers=headers)
-            if speed_mb > 0.1: # If we got data (>100KB/s equivalent or just some bytes)
+            if speed_mb > 0.05:
                 return {'working': True, 'message': f'Speed: {speed_mb:.2f} MB/s'}
 
             # 3. Fallback to FFmpeg (If download failed, maybe it's a specific protocol issue or headers)
@@ -287,7 +288,7 @@ class IPTVChecker:
             logging.warning(f"Error finding stream ID: {e}")
         return None
 
-    async def check_download_speed(self, url, duration=2, headers=None):
+    async def check_download_speed(self, url, duration=3, headers=None):
         """
         Attempts to download the stream for a short duration to calculate speed.
         Returns speed in MB/s.
@@ -298,6 +299,7 @@ class IPTVChecker:
 
         try:
             # Pass headers if provided
+            # Increased duration to allow for initial handshake
             async with session.get(url, timeout=DOWNLOAD_TIMEOUT, headers=headers) as response:
                 if response.status != 200: return 0
 
@@ -313,7 +315,8 @@ class IPTVChecker:
                     if downloaded_bytes > 512 * 1024:
                         break
         except Exception:
-            return 0
+            # Even if it errors (e.g. timeout), if we got some bytes, it might be alive
+            pass
 
         elapsed = time.time() - start_time
         if elapsed == 0: return 0
@@ -324,9 +327,20 @@ class IPTVChecker:
     async def verify_ffmpeg(self, url, headers=None):
         """
         Uses FFmpeg to verify if the stream is readable.
+        Refined to be robust against initial garbage and sync errors.
         """
         # Build headers string for FFmpeg (CRLF separated)
-        cmd_args = ["ffmpeg", "-t", "3"]
+        cmd_args = ["ffmpeg"]
+
+        # 1. Be generous with analysis time/size
+        cmd_args.extend(["-analyzeduration", "20000000"]) # 20 seconds
+        cmd_args.extend(["-probesize", "20000000"])      # 20 MB
+
+        # 2. Ignore initial errors (decode errors, etc)
+        cmd_args.extend(["-err_detect", "ignore_err"])
+
+        # 3. Read for longer (5 seconds)
+        cmd_args.extend(["-t", "5"])
 
         if headers:
             header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
@@ -344,9 +358,10 @@ class IPTVChecker:
             _, stderr = await asyncio.wait_for(process.communicate(), timeout=FFMPEG_TIMEOUT)
 
             # Check for success (return code 0 or 1 usually means it tried)
-            # Better check: look at stderr for "Duration" or bitrate
+            # Better check: look at stderr for "Duration" or bitrate or "Video:"
             output = stderr.decode('utf-8', errors='ignore')
 
+            # Loose success criteria: if we found a Video or Audio stream, it's alive.
             if "Video:" in output or "Audio:" in output:
                 return True
 

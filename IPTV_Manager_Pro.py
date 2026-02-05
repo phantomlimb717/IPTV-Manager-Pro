@@ -22,6 +22,8 @@ except ImportError:
 
 try:
     import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 except ImportError:
     print("\nError: Required library 'requests' not found. Please install it: pip install requests", file=sys.stderr)
     sys.exit(1)
@@ -33,7 +35,7 @@ try:
         QFormLayout, QMessageBox, QDialogButtonBox, QLabel,
         QListWidget, QListWidgetItem, QInputDialog, QMenu,
         QAbstractItemView, QHeaderView, QStatusBar, QProgressBar,
-        QFileDialog
+        QFileDialog, QTreeWidget, QTreeWidgetItem
     )
     from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication
     from PySide6.QtCore import (
@@ -43,6 +45,8 @@ try:
 except ImportError:
     print("\nError: Required library 'PySide6' not found. Please install it: pip install PySide6", file=sys.stderr)
     sys.exit(1)
+
+from companion_utils import MediaPlayerManager
 
 # --- Resource Path Helper for PyInstaller ---
 def resource_path(relative_path):
@@ -61,7 +65,7 @@ APP_VERSION = "0.3" # Incremented version for new features
 DATABASE_NAME = 'iptv_store.db'
 LOG_FILE = 'iptv_manager_log.txt'
 USER_AGENT = f'{APP_NAME}/{APP_VERSION} (okhttp/3.12.1)'
-API_TIMEOUT = 5
+API_TIMEOUT = (5, 10) # (connect, read) seconds
 REQUEST_DELAY_BETWEEN_CHECKS = 0.2
 SETTINGS_FILE = "settings.json"
 
@@ -480,8 +484,8 @@ def check_account_status_detailed_api(server_base_url, username, password, sessi
         processed_data['api_message'] = f"HTTP Error {e.response.status_code}"
         if response_text and ('raw_user_info' not in processed_data or not processed_data['raw_user_info']):
              processed_data['raw_user_info'] = json.dumps({"error_context_response": response_text[:500]})
-    except requests.exceptions.RequestException:
-        processed_data['api_message'] = "Connection Error"
+    except requests.exceptions.RequestException as e:
+        processed_data['api_message'] = f"Connection Error: {type(e).__name__}"
     except json.JSONDecodeError:
         processed_data['api_message'] = "Invalid JSON response"
         if response_text and ('raw_user_info' not in processed_data or not processed_data['raw_user_info']):
@@ -1036,6 +1040,477 @@ class BulkEditCategoryDialog(QDialog):
         return self.category_combo.currentText()
 
 
+class CategoryLoaderWorker(QObject):
+    data_ready = Signal(dict)
+    error_occurred = Signal(str)
+    finished = Signal()
+
+    def __init__(self, entry_data):
+        super().__init__()
+        self.entry_data = entry_data
+        self._session = None
+
+    @Slot()
+    def run(self):
+        category_data = {'live': [], 'movie': [], 'series': []}
+        try:
+            self._session = requests.Session()
+            # Note: Xtream Codes API uses 'get_vod_categories' for movies.
+            action_map = {'live': 'get_live_categories', 'movie': 'get_vod_categories', 'series': 'get_series_categories'}
+
+            server_url = self.entry_data['server_base_url']
+            username = self.entry_data['username']
+            password = self.entry_data['password']
+
+            for cat_type, action in action_map.items():
+                try:
+                    api_url = f"{server_url.rstrip('/')}/player_api.php?username={username}&password={password}&action={action}"
+                    response = self._session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
+                    response.raise_for_status()
+                    data = response.json()
+                    if isinstance(data, list):
+                        category_data[cat_type] = data
+                except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+                    logging.warning(f"Could not fetch categories for type '{cat_type}': {e}")
+
+            self.data_ready.emit(category_data)
+
+        except Exception as e:
+            self.error_occurred.emit(f"An unexpected error occurred while loading categories: {e}")
+        finally:
+            if self._session:
+                self._session.close()
+            self.finished.emit()
+
+class StreamLoaderWorker(QObject):
+    data_ready = Signal(list)
+    error_occurred = Signal(str)
+    finished = Signal()
+
+    def __init__(self, entry_data, category_id, stream_type):
+        super().__init__()
+        self.entry_data = entry_data
+        self.category_id = category_id
+        self.stream_type = stream_type # 'live', 'movie', or 'series'
+        self._session = None
+
+    @Slot()
+    def run(self):
+        try:
+            self._session = requests.Session()
+            action_map = {
+                'live': 'get_live_streams',
+                'movie': 'get_vod_streams',
+                'series': 'get_series'
+            }
+            action = action_map.get(self.stream_type)
+            if not action:
+                raise ValueError(f"Invalid stream type: {self.stream_type}")
+
+            server_url = self.entry_data['server_base_url']
+            username = self.entry_data['username']
+            password = self.entry_data['password']
+
+            api_url = f"{server_url.rstrip('/')}/player_api.php?username={username}&password={password}&action={action}"
+            if self.category_id != '*':
+                api_url += f"&category_id={self.category_id}"
+            response = self._session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
+            response.raise_for_status()
+            data = response.json()
+
+            if isinstance(data, list):
+                self.data_ready.emit(data)
+            else:
+                self.error_occurred.emit(f"Unexpected data returned for streams: {str(data)[:200]}")
+
+        except requests.exceptions.RequestException as e:
+            self.error_occurred.emit(f"Network Error fetching streams: {e}")
+        except json.JSONDecodeError:
+            self.error_occurred.emit("API returned invalid JSON for streams.")
+        except Exception as e:
+            self.error_occurred.emit(f"An unexpected error occurred loading streams: {e}")
+        finally:
+            if self._session:
+                self._session.close()
+            self.finished.emit()
+
+class SeriesInfoWorker(QObject):
+    data_ready = Signal(dict)
+    error_occurred = Signal(str)
+    finished = Signal()
+
+    def __init__(self, entry_data, series_id):
+        super().__init__()
+        self.entry_data = entry_data
+        self.series_id = series_id
+        self._session = None
+
+    @Slot()
+    def run(self):
+        try:
+            self._session = requests.Session()
+            server_url = self.entry_data['server_base_url']
+            username = self.entry_data['username']
+            password = self.entry_data['password']
+
+            api_url = f"{server_url.rstrip('/')}/player_api.php?username={username}&password={password}&action=get_series_info&series_id={self.series_id}"
+            response = self._session.get(api_url, timeout=API_TIMEOUT, headers=API_HEADERS)
+            response.raise_for_status()
+            data = response.json()
+            self.data_ready.emit(data)
+
+        except requests.exceptions.RequestException as e:
+            self.error_occurred.emit(f"Network Error: {e}")
+        except json.JSONDecodeError:
+            self.error_occurred.emit("API returned invalid JSON for series info.")
+        except Exception as e:
+            self.error_occurred.emit(f"An unexpected error occurred: {e}")
+        finally:
+            if self._session:
+                self._session.close()
+            self.finished.emit()
+
+class PlaylistFilterProxyModel(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._search_terms = []
+
+    def set_search_text(self, text):
+        """Splits the search text into terms and triggers a filter update."""
+        self._search_terms = text.lower().split()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        """
+        Accepts a row if its name contains all of the search terms.
+        The search is case-insensitive.
+        """
+        if not self._search_terms:
+            return True # No filter, show all
+
+        index = self.sourceModel().index(source_row, 0, source_parent)
+        item_text = self.sourceModel().data(index, Qt.DisplayRole)
+        if not item_text:
+            return False
+
+        item_text_lower = item_text.lower()
+
+        # Check if all search terms are in the item text
+        for term in self._search_terms:
+            if term not in item_text_lower:
+                return False
+
+        return True
+
+class PlaylistBrowserDialog(QDialog):
+    def __init__(self, entry_data, parent=None):
+        super().__init__(parent)
+        self.entry_data = entry_data
+        self.media_player_manager = MediaPlayerManager()
+        self.category_data = {} # Renamed from playlist_data
+        self.category_worker_thread = None
+        self.stream_worker_thread = None
+        self.series_info_thread = None
+        self.original_window_title = f"Playlist for {self.entry_data['name']}"
+
+        self.setWindowTitle(self.original_window_title)
+        self.setMinimumSize(800, 600)
+        self.setWindowModality(Qt.WindowModal)
+
+        # UI Elements
+        self.category_tree = QTreeWidget()
+        self.category_tree.setHeaderHidden(True)
+        self.stream_table = QTableView()
+        self.search_bar = QLineEdit()
+        self.play_button = QPushButton("Play Selected")
+        self.status_label = QLabel("Loading categories...")
+
+        # Models for the table
+        self.stream_model = QStandardItemModel(0, 2) # Name, Stream ID (hidden)
+        self.stream_model.setHorizontalHeaderLabels(["Name", "Stream ID"])
+        self.proxy_model = PlaylistFilterProxyModel()
+        self.proxy_model.setSourceModel(self.stream_model)
+        self.proxy_model.setFilterKeyColumn(0)
+        self.stream_table.setModel(self.proxy_model)
+        self.stream_table.setSortingEnabled(True)
+        self.stream_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.stream_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.stream_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.stream_table.setColumnHidden(1, True)
+
+
+        self.setup_ui()
+        self.setup_connections()
+        self.load_playlist_data()
+
+    def setup_ui(self):
+        self.main_layout = QHBoxLayout(self)
+
+        self.left_widget = QWidget()
+        left_layout = QVBoxLayout(self.left_widget)
+        left_layout.addWidget(QLabel("Categories"))
+        left_layout.addWidget(self.category_tree)
+
+        right_layout = QVBoxLayout()
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("Search:"))
+        search_layout.addWidget(self.search_bar)
+        right_layout.addLayout(search_layout)
+        right_layout.addWidget(self.stream_table)
+
+        bottom_layout = QHBoxLayout()
+        bottom_layout.addWidget(self.status_label)
+        bottom_layout.addStretch()
+        bottom_layout.addWidget(self.play_button)
+        right_layout.addLayout(bottom_layout)
+
+        self.main_layout.addWidget(self.left_widget, 1)
+        self.main_layout.addLayout(right_layout, 3)
+
+    def setup_connections(self):
+        self.search_bar.textChanged.connect(self.proxy_model.set_search_text)
+        self.category_tree.itemClicked.connect(self.on_category_clicked)
+        self.play_button.clicked.connect(self.on_play_clicked)
+        self.stream_table.doubleClicked.connect(self.on_play_clicked)
+
+    def load_playlist_data(self):
+        # This is now for loading categories
+        self.category_worker = CategoryLoaderWorker(self.entry_data)
+        self.category_worker_thread = QThread()
+        self.category_worker.moveToThread(self.category_worker_thread)
+        self.category_worker_thread.started.connect(self.category_worker.run)
+        self.category_worker.data_ready.connect(self.on_categories_ready)
+        self.category_worker.error_occurred.connect(self.on_load_error)
+        self.category_worker.finished.connect(self.category_worker_thread.quit)
+        self.category_worker.finished.connect(self.category_worker.deleteLater)
+        self.category_worker_thread.start()
+
+    @Slot(dict)
+    def on_categories_ready(self, data):
+        self.category_data = data
+        self.category_tree.clear()
+
+        type_map = {'live': "Live TV", 'movie': "Movies", 'series': "Series"}
+
+        for cat_type, categories in self.category_data.items():
+            if categories:
+                top_level_item = QTreeWidgetItem([type_map[cat_type]])
+                self.category_tree.addTopLevelItem(top_level_item)
+
+                # Add "All" sub-category
+                all_child_item = QTreeWidgetItem(["All"])
+                all_child_item.setData(0, Qt.UserRole, {'type': cat_type, 'id': '*'})
+                top_level_item.addChild(all_child_item)
+
+                for category in categories:
+                    child_item = QTreeWidgetItem([category['category_name']])
+                    child_item.setData(0, Qt.UserRole, {'type': cat_type, 'id': category['category_id']})
+                    top_level_item.addChild(child_item)
+
+        self.category_tree.expandAll()
+        self.status_label.setText("Ready. Select a category.")
+        self.category_worker_thread.quit()
+
+    @Slot(str)
+    def on_load_error(self, error_message):
+        QMessageBox.critical(self, "Error Loading Playlist", error_message)
+        self.status_label.setText(f"Error: {error_message}")
+        if self.category_worker_thread and self.category_worker_thread.isRunning():
+            self.category_worker_thread.quit()
+        if self.stream_worker_thread and self.stream_worker_thread.isRunning():
+            self.stream_worker_thread.quit()
+        if self.series_info_thread and self.series_info_thread.isRunning():
+            self.series_info_thread.quit()
+
+    @Slot(QTreeWidgetItem, int)
+    def on_category_clicked(self, item, column):
+        # Stop any existing worker threads before starting a new one
+        if self.stream_worker_thread and self.stream_worker_thread.isRunning():
+            self.stream_worker_thread.quit()
+            self.stream_worker_thread.wait() # Wait for the thread to finish
+
+        if self.series_info_thread and self.series_info_thread.isRunning():
+            self.series_info_thread.quit()
+            self.series_info_thread.wait()
+
+        if self.windowTitle() != self.original_window_title:
+            self.setWindowTitle(self.original_window_title)
+
+        category_info = item.data(0, Qt.UserRole)
+        cat_id = None
+        stream_type = None
+
+        if category_info: # It's a sub-category item
+            cat_id = category_info.get('id', '*') # Use '*' for 'All'
+            stream_type = category_info.get('type')
+        elif not item.parent(): # It's a top-level item
+            top_level_text = item.text(0)
+            if top_level_text == "Live TV":
+                stream_type = 'live'
+            elif top_level_text == "Movies":
+                stream_type = 'movie'
+            elif top_level_text == "Series":
+                stream_type = 'series'
+            cat_id = '*' # Signal to load all streams
+
+        if not stream_type:
+            return
+
+        self.status_label.setText(f"Loading {item.text(0)}...")
+        self.stream_model.removeRows(0, self.stream_model.rowCount())
+
+        # Start the stream loader worker
+        self.stream_worker = StreamLoaderWorker(self.entry_data, cat_id, stream_type)
+        self.stream_worker_thread = QThread()
+        self.stream_worker.moveToThread(self.stream_worker_thread)
+        self.stream_worker_thread.started.connect(self.stream_worker.run)
+        self.stream_worker.data_ready.connect(self.on_streams_ready)
+        self.stream_worker.error_occurred.connect(self.on_load_error)
+        self.stream_worker.finished.connect(self.stream_worker_thread.quit)
+        self.stream_worker.finished.connect(self.stream_worker.deleteLater)
+        self.stream_worker_thread.start()
+
+    @Slot(list)
+    def on_streams_ready(self, streams):
+        self.stream_model.removeRows(0, self.stream_model.rowCount())
+        for stream in streams:
+            name = stream.get('name', 'No Name')
+            stream_id = str(stream.get('stream_id'))
+
+            # For VOD, name might be None, but title might exist
+            if not name and 'title' in stream:
+                name = stream.get('title')
+
+            name_item = QStandardItem(name)
+            id_item = QStandardItem(stream_id)
+            self.stream_model.appendRow([name_item, id_item])
+
+        self.status_label.setText(f"Loaded {len(streams)} items.")
+        self.stream_worker_thread.quit()
+
+    def on_play_clicked(self):
+        selected_indexes = self.stream_table.selectionModel().selectedRows()
+        if not selected_indexes:
+            return
+
+        source_index = self.proxy_model.mapToSource(selected_indexes[0])
+        stream_id = self.stream_model.item(source_index.row(), 1).text()
+
+        # Check if we are in an episode view by checking the window title,
+        # which is changed when series info is loaded.
+        if self.windowTitle() != self.original_window_title:
+            self.play_episode(stream_id)
+            return
+
+        # If not in episode view, determine type from category tree
+        current_item = self.category_tree.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "No Category Selected", "Please select a category from the list before playing.")
+            return
+
+        # Determine the top-level category (Live TV, Movies, Series)
+        parent = current_item.parent()
+        if parent:
+            top_level_category_name = parent.text(0)
+        else:
+            top_level_category_name = current_item.text(0)
+
+        if top_level_category_name == 'Series':
+            self.fetch_series_episodes(stream_id)
+        elif top_level_category_name == 'Movies':
+            self.play_vod_or_live(stream_id, 'Movies') # Pass 'Movies' to play_vod_or_live
+        elif top_level_category_name == 'Live TV':
+            self.play_vod_or_live(stream_id, 'Live TV') # Pass 'Live TV' for play_vod_or_live
+        else:
+            QMessageBox.warning(self, "Error", f"Could not determine stream type for category '{top_level_category_name}'.")
+
+    def play_vod_or_live(self, stream_id, category):
+        server = self.entry_data['server_base_url']
+        username = self.entry_data['username']
+        password = self.entry_data['password']
+        stream_type = 'movie' if category == 'Movies' else 'live'
+        extension = ".mp4" if category == 'Movies' else ".ts"
+        stream_url = f"{server}/{stream_type}/{username}/{password}/{stream_id}{extension}"
+        self.media_player_manager.play_stream(stream_url, self, referer_url=server)
+
+    def play_episode(self, stream_id):
+        server = self.entry_data['server_base_url']
+        username = self.entry_data['username']
+        password = self.entry_data['password']
+        stream_url = f"{server}/series/{username}/{password}/{stream_id}.mp4"
+        self.media_player_manager.play_stream(stream_url, self, referer_url=server)
+
+    def fetch_series_episodes(self, series_id):
+        if self.series_info_thread and self.series_info_thread.isRunning():
+            self.series_info_thread.quit()
+            self.series_info_thread.wait()
+
+        self.status_label.setText(f"Fetching episodes for series ID: {series_id}...")
+        self.series_worker = SeriesInfoWorker(self.entry_data, series_id)
+        self.series_info_thread = QThread()
+        self.series_worker.moveToThread(self.series_info_thread)
+        self.series_info_thread.started.connect(self.series_worker.run)
+        self.series_worker.data_ready.connect(self.on_series_info_ready)
+        self.series_worker.error_occurred.connect(self.on_load_error)
+        self.series_worker.finished.connect(self.series_info_thread.quit)
+        self.series_worker.finished.connect(self.series_worker.deleteLater)
+        self.series_info_thread.start()
+
+    @Slot(dict)
+    def on_series_info_ready(self, data):
+        self.stream_model.removeRows(0, self.stream_model.rowCount())
+        series_name = data.get('info', {}).get('name', 'Series')
+        self.setWindowTitle(f"Episodes for: {series_name}")
+
+        episodes = data.get('episodes', {})
+
+        # Helper function to add an episode to the model
+        def add_episode_to_model(episode):
+            title = episode.get('title', 'No Title')
+            episode_id = str(episode.get('id'))
+            season_num = episode.get('season', 0)
+            episode_num = episode.get('episode_num', 0)
+
+            display_title = f"S{season_num} E{episode_num} - {title}"
+            name_item = QStandardItem(display_title)
+            id_item = QStandardItem(episode_id)
+            self.stream_model.appendRow([name_item, id_item])
+
+        # Handle both dictionary (grouped by season) and list (flat) of episodes
+        if isinstance(episodes, dict):
+            # Sort seasons numerically if possible
+            try:
+                sorted_seasons = sorted(episodes.keys(), key=int)
+            except (ValueError, TypeError):
+                sorted_seasons = sorted(episodes.keys())
+
+            for season_num in sorted_seasons:
+                season_episodes = episodes[season_num]
+                if isinstance(season_episodes, list):
+                    for episode in season_episodes:
+                        add_episode_to_model(episode)
+        elif isinstance(episodes, list):
+            for episode in episodes:
+                add_episode_to_model(episode)
+
+        # self.category_list.hide() # QTreeWidget is used now
+        # self.back_button.show() # Back button is removed
+        self.status_label.setText(f"Loaded {self.stream_model.rowCount()} episodes.")
+        self.series_info_thread.quit()
+
+    def closeEvent(self, event):
+        if self.category_worker_thread and self.category_worker_thread.isRunning():
+            self.category_worker_thread.quit()
+            self.category_worker_thread.wait()
+        if self.stream_worker_thread and self.stream_worker_thread.isRunning():
+            self.stream_worker_thread.quit()
+            self.stream_worker_thread.wait()
+        if self.series_info_thread and self.series_info_thread.isRunning():
+            self.series_info_thread.quit()
+            self.series_info_thread.wait()
+        super().closeEvent(event)
+
+
 # =============================================================================
 # API CHECKER WORKER
 # =============================================================================
@@ -1055,15 +1530,23 @@ class ApiCheckerWorker(QObject):
     def initialize_session(self):
         if not self._session:
             try:
-                logging.info("API Worker: Initializing session...")
+                logging.info("API Worker: Initializing session with retries...")
                 self._session = requests.Session()
+                retry_strategy = Retry(
+                    total=3,
+                    backoff_factor=1,
+                    status_forcelist=[429, 500, 502, 503, 504],
+                    allowed_methods=["HEAD", "GET", "OPTIONS"]
+                )
+                adapter = HTTPAdapter(max_retries=retry_strategy)
+                self._session.mount("http://", adapter)
+                self._session.mount("https://", adapter)
                 logging.info("API Worker: Session initialized.")
-                self.session_initialized_signal.emit() # Notify that session is ready
+                self.session_initialized_signal.emit()
             except Exception as e:
                 logging.error(f"API Worker: Failed to initialize session: {e}")
-                # Optionally, emit a failure signal or handle error
                 self.status_message_updated.emit("Error: Could not initialize network session.")
-                self._is_running = False # Stop further processing if session fails
+                self._is_running = False
 
     @Slot()
     def stop_processing(self):
@@ -1514,8 +1997,22 @@ class MainWindow(QMainWindow):
         if not entry_id_item: return
         entry_id = entry_id_item.data(Qt.UserRole)
 
-        diag = EntryDialog(entry_id=entry_id, parent=self)
-        if diag.exec(): self.refresh_row_by_id(entry_id); self.update_category_filter_combo()
+        # Fetch full entry data to decide which dialog to open
+        entry_data = get_entry_by_id(entry_id)
+        if not entry_data:
+            QMessageBox.warning(self, "Error", "Could not retrieve entry data.")
+            return
+
+        account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
+        api_status = entry_data['api_status']
+
+        # If it's an active XC account, open the playlist browser. Otherwise, open the edit dialog.
+        if account_type == 'xc' and api_status and 'active' in api_status.lower():
+            diag = PlaylistBrowserDialog(entry_data=entry_data, parent=self)
+            diag.exec() # This dialog is for browsing, no refresh needed on close
+        else:
+            diag = EntryDialog(entry_id=entry_id, parent=self)
+            if diag.exec(): self.refresh_row_by_id(entry_id); self.update_category_filter_combo()
 
     @Slot()
     def bulk_edit_category_action(self):
@@ -1984,21 +2481,17 @@ class MainWindow(QMainWindow):
 
 
     def closeEvent(self, event):
-        self.save_settings() # Save settings on close
-        if self._is_checking_api:
-            reply = QMessageBox.question(self, "Confirm Exit", "API checks in progress. Exit anyway?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                logging.info("User chose to exit during API checks.")
-                if self.api_worker:
-                    self.api_worker.stop_processing()
-                if self.api_thread:
-                    self.api_thread.quit()
-                event.accept()
-            else:
-                event.ignore()
-                return
-        else:
-            event.accept()
+        self.save_settings()
+        if self._is_checking_api and self.api_thread and self.api_thread.isRunning():
+            logging.info("Attempting to stop API worker thread before closing...")
+            self.api_worker.stop_processing()
+            self.api_thread.quit()
+            # Wait a bit for the thread to finish gracefully.
+            if not self.api_thread.wait(1000): # Wait 1 sec
+                logging.warning("API thread did not stop gracefully. Forcing termination.")
+                self.api_thread.terminate() # Fallback if it doesn't quit
+                self.api_thread.wait() # Wait for termination
+        event.accept()
         logging.info(f"{APP_NAME} closing.")
 
     def load_settings(self):
@@ -2076,11 +2569,6 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG)
     logging.info("Application starting with DEBUG level logging.")
-
-    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
-        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
-        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

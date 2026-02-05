@@ -14,6 +14,7 @@ A desktop application for managing and checking the status of IPTV account crede
     - Xtream Codes API `get.php` style URLs.
     - Stalker Portal credentials in the formats listed below.
 - **Status Checking:** Check account status (including expiry date, active/max connections for Xtream Codes API) for both Xtream Codes and Stalker Portal type accounts.
+- **Integrated Playlist Browser:** Double-click an active Xtream Codes account to browse and play Live, Movie, and Series content directly through an external media player (FFplay or MPV).
 - **Categorization:** Organize your entries into custom categories.
 - **Advanced Filtering:** Quickly search the list by any field and filter by category.
 - **Export Data:**
@@ -49,7 +50,8 @@ No installation is required. Simply download the `IPTV_Manager_Pro.exe` file and
             00:1A:79:YY:YY:YA
             ```
 4.  Select accounts and use the `Check Selected` or `Check All Visible` buttons to refresh their status from the provider's API (*note*: `Check All Visible` will take a while if you have many playlists).
-5.  Use "Copy Link (Current)" or "Export Links (Selected)" to get account data:
+5.  **Browse & Play:** For an active Xtream Codes account, double-click the entry to open the new Playlist Browser. From there, you can browse and play all available Live, Movie, and Series content.
+6.  Use "Copy Link (Current)" or "Export Links (Selected)" to get account data:
     *   For Xtream Codes API entries, this will be the M3U playable link.
     *   For Stalker Portal entries, this will be a credential string in the format `stalker_portal:URL,mac:MAC_ADDRESS` (useful for backup or re-importing into this tool or others that might support this format).
 
@@ -79,10 +81,10 @@ For the full legal terms and conditions, please see the [LICENSE](LICENSE) file 
 
 ---
 
-## Acknowledgments
+## Acknowledgements
 
-
+- A special thanks to **kidpoleon** for their work on the [iptv-companion](https://github.com/kidpoleon/iptv-companion) project. The new Playlist Browser feature in this application was directly inspired by their excellent design and implementation, reflecting a great spirit of open-source collaboration.
 - The application icon was created by **[Icons8](https://icons8.com)** and sourced from **[Icon-Icons.com](https://icon-icons.com/icon/tv-television-screen/54127)**.
-
+- This feature integration was developed with the assistance of the AI software engineer, **Jules**.
 
 ---

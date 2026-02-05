@@ -861,7 +861,7 @@ class PlaylistFilterProxyModel(QSortFilterProxyModel):
     def set_search_text(self, text):
         """Splits the search text into terms and triggers a filter update."""
         self._search_terms = text.lower().split()
-        self.invalidateFilter()
+        self.invalidate()
 
     def filterAcceptsRow(self, source_row, source_parent):
         """
@@ -1344,11 +1344,11 @@ class EntryFilterProxyModel(QSortFilterProxyModel):
 
     def set_search_text(self, text):
         self._search_text = text.lower()
-        self.invalidateFilter()
+        self.invalidate()
 
     def set_exclude_na(self, exclude):
         self._exclude_na = exclude
-        self.invalidateFilter()
+        self.invalidate()
 
     def filterAcceptsRow(self, source_row, source_parent):
         search_match = True
@@ -1574,7 +1574,7 @@ class MainWindow(QMainWindow):
         try:
             for row_data in get_all_entries(category_filter=self.current_category_filter): self.table_model.appendRow(self.create_row_items(row_data))
         except Exception as e: logging.error(f"Error loading entries: {e}"); QMessageBox.critical(self, "Load Error", f"Could not load: {e}")
-        self.proxy_model.invalidateFilter()
+        self.proxy_model.invalidate()
 
     def create_row_items(self, entry_data):
         items = []; id_item = QStandardItem(str(entry_data['id'])); id_item.setData(entry_data['id'], Qt.UserRole); items.append(id_item)
@@ -2135,10 +2135,10 @@ class MainWindow(QMainWindow):
                         if col == COL_STATUS: self.apply_status_coloring(existing_item, item_data.text())
                     else:
                         self.table_model.setItem(row, col, item_data)
-                self.proxy_model.invalidateFilter()
+                self.proxy_model.invalidate()
                 return
         logging.warning(f"Could not find row for ID {entry_id} to refresh directly in source model, or it's filtered. Proxy will update.")
-        self.proxy_model.invalidateFilter()
+        self.proxy_model.invalidate()
 
     @Slot()
     def _clear_thread_references(self):

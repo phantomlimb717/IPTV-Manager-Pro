@@ -237,13 +237,19 @@ class IPTVChecker:
             # Format: http://server:port/username/password/stream_id.ts
             stream_url = f"{server_url.rstrip('/')}/{username}/{password}/{stream_id}.ts"
 
+            # Create headers for stream checks (Referer and UA)
+            headers = {
+                'User-Agent': USER_AGENT,
+                'Referer': f"{server_url.rstrip('/')}/"
+            }
+
             # 2. Try Speed Test (Fastest)
-            speed_mb = await self.check_download_speed(stream_url)
+            speed_mb = await self.check_download_speed(stream_url, headers=headers)
             if speed_mb > 0.1: # If we got data (>100KB/s equivalent or just some bytes)
                 return {'working': True, 'message': f'Speed: {speed_mb:.2f} MB/s'}
 
             # 3. Fallback to FFmpeg (If download failed, maybe it's a specific protocol issue or headers)
-            ffmpeg_ok = await self.verify_ffmpeg(stream_url)
+            ffmpeg_ok = await self.verify_ffmpeg(stream_url, headers=headers)
             if ffmpeg_ok:
                  return {'working': True, 'message': 'Verified with FFmpeg'}
 
@@ -281,7 +287,7 @@ class IPTVChecker:
             logging.warning(f"Error finding stream ID: {e}")
         return None
 
-    async def check_download_speed(self, url, duration=2):
+    async def check_download_speed(self, url, duration=2, headers=None):
         """
         Attempts to download the stream for a short duration to calculate speed.
         Returns speed in MB/s.
@@ -291,7 +297,8 @@ class IPTVChecker:
         downloaded_bytes = 0
 
         try:
-            async with session.get(url, timeout=DOWNLOAD_TIMEOUT) as response:
+            # Pass headers if provided
+            async with session.get(url, timeout=DOWNLOAD_TIMEOUT, headers=headers) as response:
                 if response.status != 200: return 0
 
                 while True:
@@ -314,22 +321,22 @@ class IPTVChecker:
         mb_per_s = (downloaded_bytes / (1024 * 1024)) / elapsed
         return mb_per_s
 
-    async def verify_ffmpeg(self, url):
+    async def verify_ffmpeg(self, url, headers=None):
         """
         Uses FFmpeg to verify if the stream is readable.
         """
-        # Command: ffmpeg -t 3 -i URL -f null -
-        cmd = [
-            "ffmpeg",
-            "-t", "3",
-            "-i", url,
-            "-f", "null",
-            "-"
-        ]
+        # Build headers string for FFmpeg (CRLF separated)
+        cmd_args = ["ffmpeg", "-t", "3"]
+
+        if headers:
+            header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
+            cmd_args.extend(["-headers", header_str])
+
+        cmd_args.extend(["-i", url, "-f", "null", "-"])
 
         try:
             process = await asyncio.create_subprocess_exec(
-                *cmd,
+                *cmd_args,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE
             )

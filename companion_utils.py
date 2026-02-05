@@ -81,9 +81,9 @@ class MediaPlayerManager:
                 headers.append(f"Referer: {referer_url}")
             command.append(f"--http-header-fields={','.join(headers)}")
         elif player_type in ["ffplay", "ffprobe"]:
-            headers = f"User-Agent: {user_agent}\\r\\n"
+            headers = f"User-Agent: {user_agent}\r\n"
             if referer_url:
-                headers += f"Referer: {referer_url}\\r\\n"
+                headers += f"Referer: {referer_url}\r\n"
             command.extend(["-headers", headers])
 
         command.append(stream_url)

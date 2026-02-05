@@ -1252,65 +1252,65 @@ class ApiCheckerWorker(QObject):
 
                 try:
                     entry = get_entry_by_id(entry_id)
-                if not entry:
-                    logging.warning(f"Worker: Entry ID {entry_id} not found.")
+                    if not entry:
+                        logging.warning(f"Worker: Entry ID {entry_id} not found.")
+                        processed_count += 1
+                        self.progress_updated.emit(processed_count, total)
+                        continue
+
+                    # Check Frozen Status
+                    frozen_until = entry['frozen_until'] or 0
+                    if time.time() < frozen_until:
+                        # Skip check
+                        frozen_dt = datetime.fromtimestamp(frozen_until).strftime('%H:%M:%S')
+                        msg = f"Skipped (Frozen until {frozen_dt})"
+                        # We send a result to update the UI status column but mostly to show skipping
+                        self.result_ready.emit(entry_id, {
+                            'api_status': 'Frozen',
+                            'api_message': msg,
+                            # Persist existing values
+                            'bad_count': entry['bad_count'],
+                            'frozen_until': entry['frozen_until']
+                        })
+                        processed_count += 1
+                        self.progress_updated.emit(processed_count, total)
+                        continue
+
+                    self.status_message_updated.emit(f"Checking: {entry['name']}...")
+
+                    # Perform Async Check
+                    entry_dict = dict(entry) # Convert Row to Dict
+                    result = await self.checker.check_entry(entry_dict)
+
+                    # Update Backoff Logic
+                    current_bad = entry['bad_count'] or 0
+
+                    if result['success']:
+                        result['bad_count'] = 0
+                        result['frozen_until'] = 0
+                    else:
+                        # If check failed
+                        status_text = str(result.get('api_status', '')).lower()
+
+                        # Criteria for freezing: Auth failure or explicit error.
+                        # Network timeouts might be transient, but repeated ones should freeze.
+                        # For now, let's freeze on any failure that isn't just "Unknown".
+                        new_bad = current_bad + 1
+                        backoff = min(86400, (2 ** new_bad) * 60) # 1m, 2m, 4m, 8m... max 24h
+                        result['bad_count'] = new_bad
+                        result['frozen_until'] = time.time() + backoff
+
+                        if not result.get('api_message'):
+                            result['api_message'] = "Check Failed"
+                        result['api_message'] += f" (Frozen {backoff}s)"
+
+                    self.result_ready.emit(entry_id, result)
+
                     processed_count += 1
                     self.progress_updated.emit(processed_count, total)
-                    continue
 
-                # Check Frozen Status
-                frozen_until = entry['frozen_until'] or 0
-                if time.time() < frozen_until:
-                    # Skip check
-                    frozen_dt = datetime.fromtimestamp(frozen_until).strftime('%H:%M:%S')
-                    msg = f"Skipped (Frozen until {frozen_dt})"
-                    # We send a result to update the UI status column but mostly to show skipping
-                    self.result_ready.emit(entry_id, {
-                        'api_status': 'Frozen',
-                        'api_message': msg,
-                        # Persist existing values
-                        'bad_count': entry['bad_count'],
-                        'frozen_until': entry['frozen_until']
-                    })
-                    processed_count += 1
-                    self.progress_updated.emit(processed_count, total)
-                    continue
-
-                self.status_message_updated.emit(f"Checking: {entry['name']}...")
-
-                # Perform Async Check
-                entry_dict = dict(entry) # Convert Row to Dict
-                result = await self.checker.check_entry(entry_dict)
-
-                # Update Backoff Logic
-                current_bad = entry['bad_count'] or 0
-
-                if result['success']:
-                    result['bad_count'] = 0
-                    result['frozen_until'] = 0
-                else:
-                    # If check failed
-                    status_text = str(result.get('api_status', '')).lower()
-
-                    # Criteria for freezing: Auth failure or explicit error.
-                    # Network timeouts might be transient, but repeated ones should freeze.
-                    # For now, let's freeze on any failure that isn't just "Unknown".
-                    new_bad = current_bad + 1
-                    backoff = min(86400, (2 ** new_bad) * 60) # 1m, 2m, 4m, 8m... max 24h
-                    result['bad_count'] = new_bad
-                    result['frozen_until'] = time.time() + backoff
-
-                    if not result.get('api_message'):
-                        result['api_message'] = "Check Failed"
-                    result['api_message'] += f" (Frozen {backoff}s)"
-
-                self.result_ready.emit(entry_id, result)
-
-                processed_count += 1
-                self.progress_updated.emit(processed_count, total)
-
-                if REQUEST_DELAY_BETWEEN_CHECKS > 0:
-                    await asyncio.sleep(REQUEST_DELAY_BETWEEN_CHECKS)
+                    if REQUEST_DELAY_BETWEEN_CHECKS > 0:
+                        await asyncio.sleep(REQUEST_DELAY_BETWEEN_CHECKS)
 
                 except Exception as e:
                     logging.error(f"Worker: Error processing entry {entry_id}: {e}")

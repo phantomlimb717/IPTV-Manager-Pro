@@ -1141,6 +1141,10 @@ class PlaylistBrowserDialog(QDialog):
 
     @Slot(dict)
     def on_series_info_ready(self, data):
+        try:
+            print(f"DEBUG: Series Data: {json.dumps(data, indent=2)}")
+        except Exception as e:
+            print(f"DEBUG: Error printing data: {e}")
         self.stream_model.removeRows(0, self.stream_model.rowCount())
         series_name = data.get('info', {}).get('name', 'Series')
         self.setWindowTitle(f"Episodes for: {series_name}")

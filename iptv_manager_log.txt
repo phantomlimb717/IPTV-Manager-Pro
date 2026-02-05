@@ -1,1 +1,6 @@
-2025-11-08 19:22:56,810 - INFO - IPTV_Manager_Pro.py:2571 - Application starting with DEBUG level logging.
+2026-02-05 10:48:23,253 - INFO - IPTV_Manager_Pro.py:102 - Initializing database: iptv_store.db
+2026-02-05 10:48:23,253 - INFO - IPTV_Manager_Pro.py:106 - Database not found. Creating 'iptv_store.db'...
+2026-02-05 10:48:23,267 - INFO - IPTV_Manager_Pro.py:155 - Adding 'live_streams_count' column to entries table.
+2026-02-05 10:48:23,269 - INFO - IPTV_Manager_Pro.py:160 - Adding 'movies_count' column to entries table.
+2026-02-05 10:48:23,271 - INFO - IPTV_Manager_Pro.py:165 - Adding 'series_count' column to entries table.
+2026-02-05 10:48:23,278 - INFO - IPTV_Manager_Pro.py:187 - Database initialized/verified successfully.

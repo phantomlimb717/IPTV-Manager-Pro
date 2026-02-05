@@ -1072,8 +1072,15 @@ class PlaylistBrowserDialog(QDialog):
             if not name and 'title' in stream:
                 name = stream.get('title')
 
+            container_extension = stream.get('container_extension')
+
             name_item = QStandardItem(name)
             id_item = QStandardItem(stream_id)
+
+            # Store container_extension in UserRole of id_item
+            if container_extension:
+                id_item.setData(container_extension, Qt.UserRole + 1) # UserRole + 1 for extension
+
             self.stream_model.appendRow([name_item, id_item])
 
         self.status_label.setText(f"Loaded {len(streams)} items.")
@@ -1085,12 +1092,16 @@ class PlaylistBrowserDialog(QDialog):
             return
 
         source_index = self.proxy_model.mapToSource(selected_indexes[0])
-        stream_id = self.stream_model.item(source_index.row(), 1).text()
+        id_item = self.stream_model.item(source_index.row(), 1)
+        stream_id = id_item.text()
+
+        # Retrieve container extension from UserRole + 1
+        container_extension = id_item.data(Qt.UserRole + 1)
 
         # Check if we are in an episode view by checking the window title,
         # which is changed when series info is loaded.
         if self.windowTitle() != self.original_window_title:
-            self.play_episode(stream_id)
+            self.play_episode(stream_id, container_extension)
             return
 
         # If not in episode view, determine type from category tree
@@ -1109,26 +1120,36 @@ class PlaylistBrowserDialog(QDialog):
         if top_level_category_name == 'Series':
             self.fetch_series_episodes(stream_id)
         elif top_level_category_name == 'Movies':
-            self.play_vod_or_live(stream_id, 'Movies') # Pass 'Movies' to play_vod_or_live
+            self.play_vod_or_live(stream_id, 'Movies', container_extension) # Pass 'Movies' to play_vod_or_live
         elif top_level_category_name == 'Live TV':
-            self.play_vod_or_live(stream_id, 'Live TV') # Pass 'Live TV' for play_vod_or_live
+            self.play_vod_or_live(stream_id, 'Live TV', None) # Live TV typically implies .ts or handled by manager, usually no ext in list
         else:
             QMessageBox.warning(self, "Error", f"Could not determine stream type for category '{top_level_category_name}'.")
 
-    def play_vod_or_live(self, stream_id, category):
+    def play_vod_or_live(self, stream_id, category, container_extension=None):
         server = self.entry_data['server_base_url']
         username = self.entry_data['username']
         password = self.entry_data['password']
         stream_type = 'movie' if category == 'Movies' else 'live'
-        extension = ".mp4" if category == 'Movies' else ".ts"
+
+        if category == 'Movies':
+            # Use provided extension or default to .mp4
+            extension = f".{container_extension}" if container_extension else ".mp4"
+        else:
+            extension = ".ts" # Default for Live TV
+
         stream_url = f"{server}/{stream_type}/{username}/{password}/{stream_id}{extension}"
         self.media_player_manager.play_stream(stream_url, self, referer_url=server)
 
-    def play_episode(self, stream_id):
+    def play_episode(self, stream_id, container_extension=None):
         server = self.entry_data['server_base_url']
         username = self.entry_data['username']
         password = self.entry_data['password']
-        stream_url = f"{server}/series/{username}/{password}/{stream_id}.mp4"
+
+        # Use provided extension or default to .mp4
+        extension = f".{container_extension}" if container_extension else ".mp4"
+
+        stream_url = f"{server}/series/{username}/{password}/{stream_id}{extension}"
         self.media_player_manager.play_stream(stream_url, self, referer_url=server)
 
     def fetch_series_episodes(self, series_id):
@@ -1168,10 +1189,16 @@ class PlaylistBrowserDialog(QDialog):
             episode_id = str(episode.get('id'))
             season_num = episode.get('season', 0)
             episode_num = episode.get('episode_num', 0)
+            container_extension = episode.get('container_extension')
 
             display_title = f"S{season_num} E{episode_num} - {title}"
             name_item = QStandardItem(display_title)
             id_item = QStandardItem(episode_id)
+
+            # Store container_extension in UserRole + 1
+            if container_extension:
+                id_item.setData(container_extension, Qt.UserRole + 1)
+
             self.stream_model.appendRow([name_item, id_item])
 
         # Handle both dictionary (grouped by season) and list (flat) of episodes

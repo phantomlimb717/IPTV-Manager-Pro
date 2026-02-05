@@ -1058,7 +1058,15 @@ class PlaylistBrowserDialog(QDialog):
         self.stream_model.removeRows(0, self.stream_model.rowCount())
         for stream in streams:
             name = stream.get('name', 'No Name')
-            stream_id = str(stream.get('stream_id'))
+
+            # Prioritize series_id for series, then stream_id, then generic id
+            stream_id = stream.get('series_id')
+            if not stream_id:
+                stream_id = stream.get('stream_id')
+            if not stream_id:
+                stream_id = stream.get('id')
+
+            stream_id = str(stream_id)
 
             # For VOD, name might be None, but title might exist
             if not name and 'title' in stream:
@@ -1145,6 +1153,14 @@ class PlaylistBrowserDialog(QDialog):
             print(f"DEBUG: Series Data: {json.dumps(data, indent=2)}")
         except Exception as e:
             print(f"DEBUG: Error printing data: {e}")
+
+        if not isinstance(data, dict):
+            logging.error(f"Series Info API returned unexpected type: {type(data)}. Data: {data}")
+            self.status_label.setText("Error: API returned invalid data format for Series Info.")
+            if self.series_info_thread and self.series_info_thread.isRunning():
+                self.series_info_thread.quit()
+            return
+
         self.stream_model.removeRows(0, self.stream_model.rowCount())
         series_name = data.get('info', {}).get('name', 'Series')
         self.setWindowTitle(f"Episodes for: {series_name}")

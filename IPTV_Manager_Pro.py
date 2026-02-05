@@ -1149,11 +1149,6 @@ class PlaylistBrowserDialog(QDialog):
 
     @Slot(object)
     def on_series_info_ready(self, data):
-        try:
-            print(f"DEBUG: Series Data: {json.dumps(data, indent=2)}")
-        except Exception as e:
-            print(f"DEBUG: Error printing data: {e}")
-
         if not isinstance(data, dict):
             logging.error(f"Series Info API returned unexpected type: {type(data)}. Data: {data}")
             self.status_label.setText("Error: API returned invalid data format for Series Info.")

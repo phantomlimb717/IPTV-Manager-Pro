@@ -36,7 +36,7 @@ try:
         QFormLayout, QMessageBox, QDialogButtonBox, QLabel,
         QListWidget, QListWidgetItem, QInputDialog, QMenu,
         QAbstractItemView, QHeaderView, QStatusBar, QProgressBar,
-        QFileDialog, QTreeWidget, QTreeWidgetItem
+        QFileDialog, QTreeWidget, QTreeWidgetItem, QCheckBox
     )
     from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QAction, QIcon, QKeySequence, QGuiApplication
     from PySide6.QtCore import (
@@ -391,7 +391,7 @@ def format_trial_status_display(is_trial):
 class EntryDialog(QDialog):
     def __init__(self, entry_id=None, parent=None):
         super().__init__(parent); self.entry_id = entry_id; self.is_edit_mode = entry_id is not None
-        self.setWindowTitle(f"{'Edit' if self.is_edit_mode else 'Add'} IPTV Entry"); self.setMinimumWidth(450); self.setWindowModality(Qt.WindowModal)
+        self.setWindowTitle(f"{'Edit' if self.is_edit_mode else 'Add'} IPTV Entry"); self.setMinimumWidth(550); self.setWindowModality(Qt.WindowModal)
         layout = QVBoxLayout(self); form_layout = QFormLayout()
 
         self.name_edit = QLineEdit()
@@ -408,8 +408,15 @@ class EntryDialog(QDialog):
         self.username_label = QLabel("Username:")
         self.username_edit = QLineEdit()
         self.password_label = QLabel("Password:")
+
+        # Password field setup with visibility toggle
+        self.password_layout = QHBoxLayout()
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.Password)
+        self.show_password_cb = QCheckBox("Show")
+        self.show_password_cb.toggled.connect(self.toggle_password_visibility)
+        self.password_layout.addWidget(self.password_edit)
+        self.password_layout.addWidget(self.show_password_cb)
 
         # Stalker Portal Fields
         self.portal_url_label = QLabel("Portal URL (e.g., http://domain:port/c/):")
@@ -424,7 +431,7 @@ class EntryDialog(QDialog):
         # Add XC fields (will be shown/hidden)
         form_layout.addRow(self.server_url_label, self.server_url_edit)
         form_layout.addRow(self.username_label, self.username_edit)
-        form_layout.addRow(self.password_label, self.password_edit)
+        form_layout.addRow(self.password_label, self.password_layout)
 
         # Add Stalker fields (will be shown/hidden)
         form_layout.addRow(self.portal_url_label, self.portal_url_edit)
@@ -443,6 +450,12 @@ class EntryDialog(QDialog):
 
         self.name_edit.setFocus()
 
+    def toggle_password_visibility(self, checked):
+        if checked:
+            self.password_edit.setEchoMode(QLineEdit.Normal)
+        else:
+            self.password_edit.setEchoMode(QLineEdit.Password)
+
     def toggle_input_fields(self, account_type_text):
         is_stalker = account_type_text == "Stalker Portal"
 
@@ -453,6 +466,7 @@ class EntryDialog(QDialog):
         self.username_edit.setVisible(not is_stalker)
         self.password_label.setVisible(not is_stalker)
         self.password_edit.setVisible(not is_stalker)
+        self.show_password_cb.setVisible(not is_stalker)
 
         # Stalker Fields
         self.portal_url_label.setVisible(is_stalker)
@@ -2337,6 +2351,9 @@ class MainWindow(QMainWindow):
                 QPushButton { background-color: #d0d0d0; border: 1px solid #b0b0b0; padding: 5px; }
                 QPushButton:hover { background-color: #c0c0c0; }
                 QLineEdit, QComboBox { background-color: white; border: 1px solid #ccc; padding: 3px; }
+                QMenu { background-color: #f0f0f0; border: 1px solid #ccc; }
+                QMenu::item { padding: 5px 20px; }
+                QMenu::item:selected { background-color: #a6cfff; }
             """)
         elif theme_name == "dark":
             self.dark_theme_action.setChecked(True)
@@ -2348,7 +2365,8 @@ class MainWindow(QMainWindow):
                 QPushButton { background-color: #5e5e5e; border: 1px solid #7e7e7e; padding: 5px; }
                 QPushButton:hover { background-color: #6e6e6e; }
                 QLineEdit, QComboBox { background-color: #4e4e4e; border: 1px solid #6e6e6e; padding: 3px; }
-                QMenu { background-color: #3e3e3e; color: #f0f0f0; }
+                QMenu { background-color: #3e3e3e; color: #f0f0f0; border: 1px solid #555; }
+                QMenu::item { padding: 5px 20px; }
                 QMenu::item:selected { background-color: #5a5a5a; }
                 QStatusBar { background-color: #2e2e2e; }
             """)

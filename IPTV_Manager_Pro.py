@@ -33,7 +33,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QTableView, QPushButton, QDialog, QLineEdit, QComboBox,
-        QFormLayout, QMessageBox, QDialogButtonBox, QLabel,
+        QFormLayout, QMessageBox, QDialogButtonBox, QLabel, QGridLayout,
         QListWidget, QListWidgetItem, QInputDialog, QMenu,
         QAbstractItemView, QHeaderView, QStatusBar, QProgressBar,
         QFileDialog, QTreeWidget, QTreeWidgetItem, QCheckBox
@@ -392,38 +392,39 @@ class EntryDialog(QDialog):
     def __init__(self, entry_id=None, parent=None):
         super().__init__(parent); self.entry_id = entry_id; self.is_edit_mode = entry_id is not None
         self.setWindowTitle(f"{'Edit' if self.is_edit_mode else 'Add'} IPTV Entry")
-        self.setMinimumWidth(700) # Increased min-width
+        self.setMinimumWidth(600)
         self.setWindowModality(Qt.WindowModal)
 
         # Apply custom stylesheet for taller fields and consistent look
         self.setStyleSheet("""
             QLineEdit, QComboBox {
-                min-height: 40px;
+                min-height: 30px;
                 padding: 5px;
-                font-size: 14px;
+                font-size: 13px;
                 border: 1px solid #ccc;
                 border-radius: 4px;
             }
             QCheckBox {
                 spacing: 8px;
-                font-size: 14px;
+                font-size: 13px;
             }
             QCheckBox::indicator {
-                width: 20px;
-                height: 20px;
+                width: 18px;
+                height: 18px;
             }
             QLabel {
-                font-size: 14px;
+                font-size: 13px;
             }
         """)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20) # Inner dialog padding
 
-        form_layout = QFormLayout()
-        form_layout.setVerticalSpacing(15) # Spacing between rows
-        form_layout.setHorizontalSpacing(20) # Spacing between label and field
-        form_layout.setContentsMargins(10, 10, 10, 10) # Breathing room around form
+        # Use QGridLayout for precise control over field width
+        grid_layout = QGridLayout()
+        grid_layout.setVerticalSpacing(15) # Spacing between rows
+        grid_layout.setHorizontalSpacing(15) # Spacing between label and field
+        grid_layout.setColumnStretch(1, 1) # Make the input column (index 1) stretch
 
         self.name_edit = QLineEdit()
         self.category_combo = QComboBox()
@@ -440,15 +441,16 @@ class EntryDialog(QDialog):
         self.username_edit = QLineEdit()
         self.password_label = QLabel("Password:")
 
-        # Password field setup with visibility toggle
-        self.password_layout = QHBoxLayout()
+        # Password field setup with visibility toggle inside a container for grid alignment
+        self.password_container = QWidget()
+        self.password_layout = QHBoxLayout(self.password_container)
+        self.password_layout.setContentsMargins(0, 0, 0, 0)
+        self.password_layout.setSpacing(10)
+
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.Password)
         self.show_password_cb = QCheckBox("Show")
         self.show_password_cb.toggled.connect(self.toggle_password_visibility)
-
-        # Ensure checkbox aligns nicely with the tall input field
-        self.show_password_cb.setFixedHeight(40)
 
         self.password_layout.addWidget(self.password_edit)
         self.password_layout.addWidget(self.show_password_cb)
@@ -459,20 +461,45 @@ class EntryDialog(QDialog):
         self.mac_address_label = QLabel("MAC Address (XX:XX:XX:XX:XX:XX):")
         self.mac_address_edit = QLineEdit()
 
-        form_layout.addRow("Display Name:", self.name_edit)
-        form_layout.addRow("Category:", self.category_combo)
-        form_layout.addRow("Account Type:", self.account_type_combo)
+        # Add widgets to Grid Layout
+        row = 0
+        grid_layout.addWidget(QLabel("Display Name:"), row, 0)
+        grid_layout.addWidget(self.name_edit, row, 1)
+        row += 1
 
-        # Add XC fields (will be shown/hidden)
-        form_layout.addRow(self.server_url_label, self.server_url_edit)
-        form_layout.addRow(self.username_label, self.username_edit)
-        form_layout.addRow(self.password_label, self.password_layout)
+        grid_layout.addWidget(QLabel("Category:"), row, 0)
+        grid_layout.addWidget(self.category_combo, row, 1)
+        row += 1
 
-        # Add Stalker fields (will be shown/hidden)
-        form_layout.addRow(self.portal_url_label, self.portal_url_edit)
-        form_layout.addRow(self.mac_address_label, self.mac_address_edit)
+        grid_layout.addWidget(QLabel("Account Type:"), row, 0)
+        grid_layout.addWidget(self.account_type_combo, row, 1)
+        row += 1
 
-        layout.addLayout(form_layout)
+        # XC fields
+        grid_layout.addWidget(self.server_url_label, row, 0)
+        grid_layout.addWidget(self.server_url_edit, row, 1)
+        row += 1
+
+        grid_layout.addWidget(self.username_label, row, 0)
+        grid_layout.addWidget(self.username_edit, row, 1)
+        row += 1
+
+        grid_layout.addWidget(self.password_label, row, 0)
+        grid_layout.addWidget(self.password_container, row, 1)
+        row += 1
+
+        # Stalker fields (added to grid but visibility managed by toggle)
+        grid_layout.addWidget(self.portal_url_label, row, 0)
+        grid_layout.addWidget(self.portal_url_edit, row, 1)
+        row += 1
+
+        grid_layout.addWidget(self.mac_address_label, row, 0)
+        grid_layout.addWidget(self.mac_address_edit, row, 1)
+        row += 1
+
+        layout.addLayout(grid_layout)
+        layout.addStretch()
+
         self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.button_box.accepted.connect(self.accept_dialog)
         self.button_box.rejected.connect(self.reject)
@@ -500,8 +527,7 @@ class EntryDialog(QDialog):
         self.username_label.setVisible(not is_stalker)
         self.username_edit.setVisible(not is_stalker)
         self.password_label.setVisible(not is_stalker)
-        self.password_edit.setVisible(not is_stalker)
-        self.show_password_cb.setVisible(not is_stalker)
+        self.password_container.setVisible(not is_stalker)
 
         # Stalker Fields
         self.portal_url_label.setVisible(is_stalker)

@@ -391,7 +391,7 @@ def format_trial_status_display(is_trial):
 class EntryDialog(QDialog):
     def __init__(self, entry_id=None, parent=None):
         super().__init__(parent); self.entry_id = entry_id; self.is_edit_mode = entry_id is not None
-        self.setWindowTitle(f"{'Edit' if self.is_edit_mode else 'Add'} IPTV Entry"); self.setMinimumWidth(550); self.setWindowModality(Qt.WindowModal)
+        self.setWindowTitle(f"{'Edit' if self.is_edit_mode else 'Add'} IPTV Entry"); self.setMinimumWidth(850); self.setWindowModality(Qt.WindowModal)
         layout = QVBoxLayout(self); form_layout = QFormLayout()
 
         self.name_edit = QLineEdit()
@@ -635,7 +635,7 @@ class ManageCategoriesDialog(QDialog):
 
 class ImportUrlDialog(QDialog):
     def __init__(self, parent=None):
-        super().__init__(parent); self.setWindowTitle("Import Entry from URL"); self.setMinimumWidth(500); self.setWindowModality(Qt.WindowModal)
+        super().__init__(parent); self.setWindowTitle("Import Entry from URL"); self.setMinimumWidth(850); self.setWindowModality(Qt.WindowModal)
         layout = QVBoxLayout(self); form_layout = QFormLayout(); self.url_edit = QLineEdit(); self.url_edit.setPlaceholderText("http://server:port/get.php?username=...")
         self.name_edit = QLineEdit(); self.name_edit.setPlaceholderText("Optional: Auto-generated if blank"); self.category_combo = QComboBox(); self.populate_categories()
         form_layout.addRow("M3U Get Link URL:", self.url_edit); form_layout.addRow("Display Name (Optional):", self.name_edit); form_layout.addRow("Category:", self.category_combo)

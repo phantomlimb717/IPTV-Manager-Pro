@@ -1485,6 +1485,8 @@ class MainWindow(QMainWindow):
 
         top_controls_layout.addWidget(self.add_button)
         top_controls_layout.addWidget(self.edit_button)
+        self.browse_button = QPushButton("Browse / Play")
+        top_controls_layout.addWidget(self.browse_button)
         top_controls_layout.addWidget(self.delete_button)
         top_controls_layout.addWidget(self.delete_duplicates_button)
         top_controls_layout.addWidget(self.bulk_edit_button)
@@ -1571,6 +1573,7 @@ class MainWindow(QMainWindow):
 
         self.add_button.clicked.connect(self.add_entry_action)
         self.edit_button.clicked.connect(self.edit_entry_action)
+        self.browse_button.clicked.connect(self.browse_entry_action)
         self.delete_button.clicked.connect(self.delete_entry_action)
         self.delete_duplicates_button.clicked.connect(self.delete_duplicates_action)
         self.bulk_edit_button.clicked.connect(self.bulk_edit_category_action)
@@ -1582,7 +1585,9 @@ class MainWindow(QMainWindow):
         self.export_clipboard_button.clicked.connect(self.export_current_to_clipboard)
         self.export_txt_button.clicked.connect(self.export_selected_to_txt)
 
-        self.table_view.doubleClicked.connect(self.edit_entry_action)
+        self.table_view.doubleClicked.connect(self.on_table_double_clicked)
+        self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_view.customContextMenuRequested.connect(self.open_context_menu)
         self.category_filter_combo.currentTextChanged.connect(self.category_filter_changed)
         self.search_edit.textChanged.connect(self.on_search_text_changed)
         self.exclude_na_button.toggled.connect(self.on_exclude_na_toggled)
@@ -1688,6 +1693,7 @@ class MainWindow(QMainWindow):
         can_interact = not self._is_checking_api
 
         self.edit_button.setEnabled(selected_row_count == 1 and can_interact)
+        self.browse_button.setEnabled(selected_row_count == 1 and can_interact)
         self.delete_button.setEnabled(has_selection and can_interact)
         self.bulk_edit_button.setEnabled(has_selection and can_interact)
         self.check_selected_button.setEnabled(has_selection and can_interact)
@@ -1715,6 +1721,91 @@ class MainWindow(QMainWindow):
         if diag.exec(): self.load_entries_to_table(); self.update_category_filter_combo()
 
     @Slot()
+    def browse_entry_action(self):
+        current_proxy_index = self.table_view.currentIndex()
+        if not current_proxy_index.isValid():
+            sel_proxied = self.table_view.selectionModel().selectedRows(COL_ID)
+            if not sel_proxied: return
+            current_proxy_index = sel_proxied[0]
+
+        src_idx = self.proxy_model.mapToSource(current_proxy_index)
+        entry_id_item = self.table_model.itemFromIndex(src_idx.siblingAtColumn(COL_ID))
+        if not entry_id_item: return
+        entry_id = entry_id_item.data(Qt.UserRole)
+
+        entry_data = get_entry_by_id(entry_id)
+        if not entry_data:
+            QMessageBox.warning(self, "Error", "Could not retrieve entry data.")
+            return
+
+        account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
+
+        if account_type == 'xc':
+            diag = PlaylistBrowserDialog(entry_data=entry_data, parent=self)
+            diag.exec()
+        else:
+            QMessageBox.information(self, "Browse Not Supported", "Browsing is currently only supported for Xtream Codes API accounts.")
+
+    @Slot(QModelIndex)
+    def on_table_double_clicked(self, index):
+        if not index.isValid(): return
+
+        src_idx = self.proxy_model.mapToSource(index)
+        entry_id_item = self.table_model.itemFromIndex(src_idx.siblingAtColumn(COL_ID))
+        if not entry_id_item: return
+        entry_id = entry_id_item.data(Qt.UserRole)
+
+        entry_data = get_entry_by_id(entry_id)
+        if not entry_data: return
+
+        account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
+        api_status = entry_data['api_status']
+
+        # Smart Action: If XC and Active -> Browse, Else -> Edit
+        if account_type == 'xc' and api_status and 'active' in api_status.lower():
+            self.browse_entry_action()
+        else:
+            self.edit_entry_action()
+
+    @Slot(object) # Using object/QPoint
+    def open_context_menu(self, position):
+        menu = QMenu()
+
+        browse_action = QAction("Browse / Play", self)
+        browse_action.triggered.connect(self.browse_entry_action)
+        menu.addAction(browse_action)
+
+        edit_action = QAction("Edit", self)
+        edit_action.triggered.connect(self.edit_entry_action)
+        menu.addAction(edit_action)
+
+        menu.addSeparator()
+
+        check_action = QAction("Check Status", self)
+        check_action.triggered.connect(self.check_selected_entries_action)
+        menu.addAction(check_action)
+
+        copy_action = QAction("Copy Link", self)
+        copy_action.triggered.connect(self.export_current_to_clipboard)
+        menu.addAction(copy_action)
+
+        menu.addSeparator()
+
+        delete_action = QAction("Delete", self)
+        delete_action.triggered.connect(self.delete_entry_action)
+        menu.addAction(delete_action)
+
+        # Disable actions based on selection similar to buttons
+        selected_count = len(self.table_view.selectionModel().selectedRows())
+        browse_action.setEnabled(selected_count == 1)
+        edit_action.setEnabled(selected_count == 1)
+        check_action.setEnabled(selected_count > 0)
+        copy_action.setEnabled(selected_count == 1)
+        delete_action.setEnabled(selected_count > 0)
+
+        menu.exec(self.table_view.mapToGlobal(position))
+
+    @Slot()
     def edit_entry_action(self):
         current_proxy_index = self.table_view.currentIndex()
         if not current_proxy_index.isValid():
@@ -1727,22 +1818,9 @@ class MainWindow(QMainWindow):
         if not entry_id_item: return
         entry_id = entry_id_item.data(Qt.UserRole)
 
-        # Fetch full entry data to decide which dialog to open
-        entry_data = get_entry_by_id(entry_id)
-        if not entry_data:
-            QMessageBox.warning(self, "Error", "Could not retrieve entry data.")
-            return
-
-        account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
-        api_status = entry_data['api_status']
-
-        # If it's an active XC account, open the playlist browser. Otherwise, open the edit dialog.
-        if account_type == 'xc' and api_status and 'active' in api_status.lower():
-            diag = PlaylistBrowserDialog(entry_data=entry_data, parent=self)
-            diag.exec() # This dialog is for browsing, no refresh needed on close
-        else:
-            diag = EntryDialog(entry_id=entry_id, parent=self)
-            if diag.exec(): self.refresh_row_by_id(entry_id); self.update_category_filter_combo()
+        # Always open the Edit Dialog
+        diag = EntryDialog(entry_id=entry_id, parent=self)
+        if diag.exec(): self.refresh_row_by_id(entry_id); self.update_category_filter_combo()
 
     @Slot()
     def bulk_edit_category_action(self):

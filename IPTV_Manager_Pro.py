@@ -391,8 +391,39 @@ def format_trial_status_display(is_trial):
 class EntryDialog(QDialog):
     def __init__(self, entry_id=None, parent=None):
         super().__init__(parent); self.entry_id = entry_id; self.is_edit_mode = entry_id is not None
-        self.setWindowTitle(f"{'Edit' if self.is_edit_mode else 'Add'} IPTV Entry"); self.setMinimumWidth(550); self.setWindowModality(Qt.WindowModal)
-        layout = QVBoxLayout(self); form_layout = QFormLayout()
+        self.setWindowTitle(f"{'Edit' if self.is_edit_mode else 'Add'} IPTV Entry")
+        self.setMinimumWidth(700) # Increased min-width
+        self.setWindowModality(Qt.WindowModal)
+
+        # Apply custom stylesheet for taller fields and consistent look
+        self.setStyleSheet("""
+            QLineEdit, QComboBox {
+                min-height: 40px;
+                padding: 5px;
+                font-size: 14px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+            }
+            QCheckBox {
+                spacing: 8px;
+                font-size: 14px;
+            }
+            QCheckBox::indicator {
+                width: 20px;
+                height: 20px;
+            }
+            QLabel {
+                font-size: 14px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20) # Inner dialog padding
+
+        form_layout = QFormLayout()
+        form_layout.setVerticalSpacing(15) # Spacing between rows
+        form_layout.setHorizontalSpacing(20) # Spacing between label and field
+        form_layout.setContentsMargins(10, 10, 10, 10) # Breathing room around form
 
         self.name_edit = QLineEdit()
         self.category_combo = QComboBox()
@@ -415,6 +446,10 @@ class EntryDialog(QDialog):
         self.password_edit.setEchoMode(QLineEdit.Password)
         self.show_password_cb = QCheckBox("Show")
         self.show_password_cb.toggled.connect(self.toggle_password_visibility)
+
+        # Ensure checkbox aligns nicely with the tall input field
+        self.show_password_cb.setFixedHeight(40)
+
         self.password_layout.addWidget(self.password_edit)
         self.password_layout.addWidget(self.show_password_cb)
 

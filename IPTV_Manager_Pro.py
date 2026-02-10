@@ -830,11 +830,13 @@ class StalkerCategoryLoaderWorker(QObject):
             final_data = {'live': [], 'movie': [], 'series': []}
 
             for k, v in data.items():
-                for item in v:
-                    final_data[k].append({
-                        'category_id': item.get('id'),
-                        'category_name': item.get('title')
-                    })
+                if isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, dict):
+                            final_data[k].append({
+                                'category_id': str(item.get('id', '')),
+                                'category_name': str(item.get('title', 'Unknown'))
+                            })
 
             self.data_ready.emit(final_data)
         except Exception as e:
@@ -869,20 +871,36 @@ class StalkerStreamLoaderWorker(QObject):
 
             mapped_streams = []
             for s in streams:
+                if not isinstance(s, dict): continue
+
                 # Use 'cmd' as ID if available for Live/VOD, use 'id' for Series navigation
                 if stalker_type == 'series':
-                    s_id = s.get('id')
+                    s_id = str(s.get('id', ''))
                 else:
-                    s_id = s.get('cmd') or s.get('id')
+                    s_id = str(s.get('cmd', '') or s.get('id', ''))
 
-                mapped_streams.append({
-                    'name': s.get('name') or s.get('title'),
+                name_val = str(s.get('name', '') or s.get('title', 'Unknown'))
+                num_id = str(s.get('id', ''))
+                cmd_val = str(s.get('cmd', ''))
+
+                stream_entry = {
+                    'name': name_val,
                     'stream_id': s_id,
                     'container_extension': 'ts' if stalker_type == 'itv' else 'mp4',
-                    'series_id': s.get('id') if stalker_type == 'series' else None, # Only for series navigation
-                    'epg_id': s.get('id') if stalker_type == 'itv' else None, # Numeric ID for EPG
-                    'cmd': s.get('cmd')
-                })
+                    'cmd': cmd_val
+                }
+
+                if stalker_type == 'series':
+                    stream_entry['series_id'] = num_id
+                else:
+                    stream_entry['series_id'] = None
+
+                if stalker_type == 'itv':
+                    stream_entry['epg_id'] = num_id
+                else:
+                    stream_entry['epg_id'] = None
+
+                mapped_streams.append(stream_entry)
 
             self.data_ready.emit(mapped_streams)
         except Exception as e:
@@ -947,11 +965,12 @@ class StalkerSeriesInfoWorker(QObject):
 
             mapped_episodes = []
             for ep in episodes:
+                if not isinstance(ep, dict): continue
                 mapped_episodes.append({
-                    'title': ep.get('name') or ep.get('title'),
-                    'id': ep.get('cmd') or ep.get('id'), # Use cmd for playback!
-                    'season': ep.get('season_num', 0),
-                    'episode_num': ep.get('episode_number', 0),
+                    'title': str(ep.get('name') or ep.get('title') or 'Unknown'),
+                    'id': str(ep.get('cmd') or ep.get('id') or ''),
+                    'season': int(ep.get('season_num', 0)),
+                    'episode_num': int(ep.get('episode_number', 0)),
                     'container_extension': 'mp4'
                 })
 
@@ -1462,9 +1481,13 @@ class PlaylistBrowserDialog(QDialog):
         if hasattr(self, 'playback_thread') and self.playback_thread:
             self.playback_thread.quit()
 
+        # Ensure Referer ends with /c/ as per MAG standard
         portal_url = self.entry_data.get('portal_url', '')
-        # Pass portal URL as referer for security
-        self.media_player_manager.play_stream(url, self, referer_url=portal_url)
+        referer = portal_url
+        if not referer.endswith('/c/'):
+             referer = referer.rstrip('/') + '/c/'
+
+        self.media_player_manager.play_stream(url, self, referer_url=referer)
 
     def play_episode(self, stream_id, container_extension=None):
         server = self.entry_data['server_base_url']

@@ -2073,11 +2073,11 @@ class MainWindow(QMainWindow):
 
         account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
 
-        if account_type == 'xc':
+        if account_type == 'xc' or account_type == 'stalker':
             diag = PlaylistBrowserDialog(entry_data=entry_data, parent=self)
             diag.exec()
         else:
-            QMessageBox.information(self, "Browse Not Supported", "Browsing is currently only supported for Xtream Codes API accounts.")
+            QMessageBox.information(self, "Browse Not Supported", "Browsing is currently only supported for Xtream Codes API and Stalker accounts.")
 
     @Slot(QModelIndex)
     def on_table_double_clicked(self, index):
@@ -2094,8 +2094,9 @@ class MainWindow(QMainWindow):
         account_type = entry_data['account_type'] if entry_data['account_type'] is not None else 'xc'
         api_status = entry_data['api_status']
 
-        # Smart Action: If XC and Active -> Browse, Else -> Edit
-        if account_type == 'xc' and api_status and 'active' in api_status.lower():
+        # Smart Action: If (XC or Stalker) and Active -> Browse, Else -> Edit
+        is_active = api_status and 'active' in api_status.lower()
+        if (account_type == 'xc' or account_type == 'stalker') and is_active:
             self.browse_entry_action()
         else:
             self.edit_entry_action()

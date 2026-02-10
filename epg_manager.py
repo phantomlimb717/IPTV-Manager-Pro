@@ -21,7 +21,12 @@ class EpgManager(QThread):
 
     def stop(self):
         self._is_running = False
-        self.wait()
+        if not self.isFinished():
+            self.requestInterruption()
+            self.wait(2000) # Wait up to 2 seconds then force terminate if needed to prevent hangs
+            if self.isRunning():
+                 self.terminate()
+                 self.wait()
 
     def run(self):
         # Initialize one portal session for the EPG thread
@@ -35,7 +40,7 @@ class EpgManager(QThread):
             logger.error(f"EPG Manager: Initialization failed: {e}")
             return
 
-        while self._is_running:
+        while self._is_running and not self.isInterruptionRequested():
             if self.queue:
                 ch_id = self.queue.pop(0)
                 try:

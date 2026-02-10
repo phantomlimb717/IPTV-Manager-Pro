@@ -63,10 +63,11 @@ class MediaPlayerManager:
         executable = self.get_player_executable(player_type)
         return shutil.which(executable) is not None
 
-    def get_player_command(self, stream_url, player_type, referer_url=None, cookies=None):
+    def get_player_command(self, stream_url, player_type, referer_url=None, cookies=None, user_agent=None):
         """Generate the appropriate command line for playing a stream."""
         executable = self.get_player_executable(player_type)
-        user_agent = "VLC/3.0.18"
+        if not user_agent:
+            user_agent = "VLC/3.0.18"
 
         config = self.PLAYER_CONFIG.get(player_type, {})
         command = [executable] + config.get("base_args", [])
@@ -93,7 +94,7 @@ class MediaPlayerManager:
         command.append(stream_url)
         return command
 
-    def get_stream_info(self, stream_url, referer_url=None, cookies=None):
+    def get_stream_info(self, stream_url, referer_url=None, cookies=None, user_agent=None):
         """
         Uses ffprobe to get codec and format information for a stream.
         """
@@ -101,7 +102,7 @@ class MediaPlayerManager:
             logging.warning("ffprobe is not available, cannot get stream info.")
             return None
 
-        command = self.get_player_command(stream_url, "ffprobe", referer_url, cookies)
+        command = self.get_player_command(stream_url, "ffprobe", referer_url, cookies, user_agent)
 
         try:
             result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=15)
@@ -123,13 +124,13 @@ class MediaPlayerManager:
             logging.error(f"An unexpected error occurred while running ffprobe: {e}")
             return None
 
-    def play_stream(self, stream_url, parent_widget=None, referer_url=None, cookies=None):
+    def play_stream(self, stream_url, parent_widget=None, referer_url=None, cookies=None, user_agent=None):
         """
         Analyzes and plays a stream URL using the best available media player.
         """
         # 1. Analyze the stream
         logging.info(f"Attempting to play stream: {stream_url}")
-        stream_info = self.get_stream_info(stream_url, referer_url, cookies)
+        stream_info = self.get_stream_info(stream_url, referer_url, cookies, user_agent)
 
         if stream_info:
             logging.info(f"Stream analysis successful for: {stream_url}")
@@ -156,7 +157,7 @@ class MediaPlayerManager:
             self._show_player_not_found_error(parent_widget)
             return False
 
-        command = self.get_player_command(stream_url, player_to_use, referer_url, cookies)
+        command = self.get_player_command(stream_url, player_to_use, referer_url, cookies, user_agent)
 
         try:
             subprocess.Popen(command)

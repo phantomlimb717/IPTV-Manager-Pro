@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+import yarl
 import logging
 import json
 import time
@@ -392,6 +393,11 @@ class IPTVChecker:
     def _generate_prehash(self, token, mac):
         return hashlib.sha1(token.encode()).hexdigest()
 
+    def _generate_serial(self, mac_address):
+        # Standard MAG logic: MD5 hash of MAC, take first 13 chars, uppercase
+        md5_hash = hashlib.md5(mac_address.encode()).hexdigest()
+        return md5_hash[:13].upper()
+
     def _normalize_stalker_url(self, url):
         if not url: return ""
         url = url.strip()
@@ -405,73 +411,110 @@ class IPTVChecker:
 
     async def check_stalker_portal(self, portal_url, mac_address):
         """
-        Checks a Stalker/MAG portal.
+        Checks a Stalker/MAG portal using an isolated session and smart fallback logic.
         """
-        session = await self.get_session()
         result = {'success': False, 'api_status': 'Error'}
 
         if not portal_url or not mac_address:
             result['api_message'] = "Missing Portal URL or MAC"
             return result
 
-        # Normalize URL
-        portal_url = self._normalize_stalker_url(portal_url)
+        # Normalize Base URL (remove trailing slashes)
+        base_url = self._normalize_stalker_url(portal_url)
+
+        # Potential Endpoints to Try
+        endpoints = [
+            "/stalker_portal/server/load.php",
+            "/portal.php",
+            "/c/portal.php"
+        ]
+
+        # Create isolated session for this check to avoid cookie contamination
+        timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
+        cookie_jar = aiohttp.CookieJar(unsafe=True)
 
         try:
-            # 1. Handshake / Get Token
-            token = await self._stalker_handshake(session, portal_url, mac_address)
-            if not token:
-                result['api_message'] = "Handshake Failed (Invalid MAC or URL)"
-                return result
+            async with aiohttp.ClientSession(
+                headers={'User-Agent': MAG_USER_AGENT},
+                timeout=timeout,
+                connector=aiohttp.TCPConnector(ssl=False),
+                cookie_jar=cookie_jar
+            ) as session:
 
-            # 2. Get Profile (Verify Token)
-            profile = await self._stalker_get_profile(session, portal_url, token, mac_address)
+                # Initialize Cookies
+                # We set them on the base domain. Since we don't know the exact endpoint that will work yet,
+                # we set them on the base URL.
+                try:
+                    url_obj = yarl.URL(base_url)
+                    session.cookie_jar.update_cookies({
+                        'mac': mac_address,
+                        'stb_lang': 'en',
+                        'timezone': DEFAULT_TZ
+                    }, response_url=url_obj)
+                except Exception as e:
+                    logging.warning(f"Failed to set initial cookies: {e}")
 
-            # If profile is empty, auth failed
-            if not profile or not profile.get('id'):
-                result['api_message'] = "Profile fetch failed (Auth Invalid)"
-                return result
+                token = None
+                working_endpoint = None
 
-            # 3. Success
-            result['success'] = True
-            result['raw_user_info'] = json.dumps(profile)
+                # 1. Handshake Loop (Find Working Endpoint)
+                for endpoint in endpoints:
+                    try:
+                        api_url = f"{base_url}{endpoint}"
+                        token = await self._stalker_handshake(session, api_url, mac_address)
+                        if token:
+                            working_endpoint = api_url
+                            break
+                    except Exception as e:
+                        logging.debug(f"Handshake failed for {endpoint}: {e}")
 
-            # Parse Status
-            # Usually Stalker doesn't return a simple 'status' field in get_profile like Xtream.
-            # We assume Active if we got the profile.
-            result['api_status'] = 'Active'
+                if not token or not working_endpoint:
+                    result['api_message'] = "Handshake Failed (Invalid MAC or URL)"
+                    return result
 
-            # Expiry
-            # Try multiple fields
-            exp_date_keys = ['expire_date', 'expiration_date', 'expire_billing_date', 'phone']
-            # Note: 'phone' is sometimes hijacked for expiry in old panels
+                # 2. Get Profile (Verify Token)
+                # Use the working endpoint found during handshake
+                profile = await self._stalker_get_profile(session, working_endpoint, token, mac_address)
 
-            for k in exp_date_keys:
-                val = profile.get(k)
-                if val and str(val) != '0' and str(val) != '':
-                    ts = self._parse_stalker_date(val)
-                    if ts:
-                        result['expiry_date_ts'] = ts
-                        break
+                # If profile is empty, auth failed
+                if not profile or not profile.get('id'):
+                    result['api_message'] = "Profile fetch failed (Auth Invalid)"
+                    return result
 
-            # Check if expired
-            if result['expiry_date_ts'] and result['expiry_date_ts'] < time.time():
-                result['api_status'] = 'Expired'
+                # 3. Success
+                result['success'] = True
+                result['raw_user_info'] = json.dumps(profile)
+
+                # Parse Status
+                result['api_status'] = 'Active'
+
+                # Expiry
+                exp_date_keys = ['expire_date', 'expiration_date', 'expire_billing_date', 'phone']
+                for k in exp_date_keys:
+                    val = profile.get(k)
+                    if val and str(val) != '0' and str(val) != '':
+                        ts = self._parse_stalker_date(val)
+                        if ts:
+                            result['expiry_date_ts'] = ts
+                            break
+
+                # Check if expired
+                if result['expiry_date_ts'] and result['expiry_date_ts'] < time.time():
+                    result['api_status'] = 'Expired'
 
         except Exception as e:
             result['api_message'] = f"Stalker Error: {str(e)}"
+            logging.error(f"Stalker Check Critical Error: {e}")
 
         return result
 
-    async def _stalker_handshake(self, session, portal_url, mac_address):
-        # 1. Try standard endpoint first
-        api_url = f"{portal_url}{STALKER_API_PATH}"
+    async def _stalker_handshake(self, session, api_url, mac_address):
+        # api_url is already the full endpoint (e.g., http://.../load.php)
 
-        # Basic Headers
+        # Headers: NO manual Cookie header, handled by session.cookie_jar
         headers = {
             'User-Agent': MAG_USER_AGENT,
-            'Referer': f"{portal_url}/stalker_portal/c/",
-            'Cookie': f"mac={mac_address}; stb_lang=en; timezone={DEFAULT_TZ};"
+            'Referer': api_url
         }
 
         # Params for initial handshake
@@ -480,11 +523,13 @@ class IPTVChecker:
         try:
             async with session.get(api_url, params=params, headers=headers) as resp:
                 if resp.status == 200:
-                    data = await resp.json(content_type=None) # Handle text/html responses
+                    data = await resp.json(content_type=None)
                     token = data.get('js', {}).get('token')
                     if token: return token
+                else:
+                    logging.debug(f"Handshake HTTP {resp.status} for {api_url}")
         except Exception as e:
-            logging.debug(f"Stalker Handshake Error: {e}")
+            logging.debug(f"Stalker Handshake Error for {api_url}: {e}")
 
         # Fallback: Generate token manually
         try:
@@ -498,28 +543,38 @@ class IPTVChecker:
             # Retry
             async with session.get(api_url, params=params, headers=headers) as resp2:
                 if resp2.status == 200:
-                    # We blindly trust our generated token works if we get a 200 OK JSON
-                    # The real test is the next profile fetch.
                     return token
         except Exception as e:
             logging.debug(f"Stalker Handshake Fallback Error: {e}")
 
         return None
 
-    async def _stalker_get_profile(self, session, portal_url, token, mac_address):
-        api_url = f"{portal_url}{STALKER_API_PATH}"
+    async def _stalker_get_profile(self, session, api_url, token, mac_address):
+        # api_url is the full endpoint
+
+        # NOTE: Do NOT set manual Cookie header. Session jar handles it.
+        # But we DO need to ensure 'token' is in the cookies for this request.
+        try:
+            url_obj = yarl.URL(api_url)
+            session.cookie_jar.update_cookies({'token': token}, response_url=url_obj)
+        except Exception:
+            pass
 
         headers = {
             'User-Agent': MAG_USER_AGENT,
             'Authorization': f'Bearer {token}',
-            'Referer': f"{portal_url}/stalker_portal/c/",
-            'Cookie': f"mac={mac_address}; stb_lang=en; timezone={DEFAULT_TZ}; token={token};"
+            'Referer': api_url,
+            'X-User-Agent': 'Model: MAG250; Link: Ethernet' # Sometimes helpful
         }
 
-        # Params to mimic a real MAG box request
+        # Dynamic Serial and IDs
+        sn = self._generate_serial(mac_address)
         device_id = hashlib.sha256(mac_address.encode()).hexdigest().upper()
         device_id2 = device_id
-        signature = hashlib.sha256(f"{mac_address}{device_id}{device_id2}".encode()).hexdigest().upper()
+
+        # Correct Signature: mac + sn + device_id + device_id2
+        signature_source = f"{mac_address}{sn}{device_id}{device_id2}"
+        signature = hashlib.sha256(signature_source.encode()).hexdigest().upper()
 
         params = {
             'type': 'stb',
@@ -527,7 +582,7 @@ class IPTVChecker:
             'hd': '1',
             'ver': 'ImageDescription: 0.2.18-r23-250; ImageDate: Fri Jan 15 15:00:00 2021; PORTAL version: 5.6.1; API Version: JS API version: 343; STB API version: 146; Player Engine version: 0x58c',
             'num_banks': '2',
-            'sn': '0000000000000',
+            'sn': sn,
             'stb_type': 'MAG250',
             'client_type': 'STB',
             'image_version': '218',
@@ -546,9 +601,21 @@ class IPTVChecker:
             async with session.get(api_url, params=params, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
-                    return data.get('js', {})
+                    js_data = data.get('js', {})
+
+                    # Token Rotation: Check if server sent a new token
+                    if 'token' in js_data and js_data['token']:
+                        try:
+                            new_token = js_data['token']
+                            session.cookie_jar.update_cookies({'token': new_token}, response_url=yarl.URL(api_url))
+                        except Exception:
+                            pass
+
+                    return js_data
+                else:
+                    logging.error(f"Stalker Get Profile Failed: HTTP {resp.status} | URL: {resp.url} | Body Snippet: {(await resp.text())[:200]}")
         except Exception as e:
-            logging.debug(f"Stalker Get Profile Error: {e}")
+            logging.error(f"Stalker Get Profile Exception: {e}")
 
         return None
 

@@ -2341,11 +2341,12 @@ class MainWindow(QMainWindow):
         logging.info("QThread.finished received. Clearing Python references and re-enabling UI.")
 
         # Safe cleanup
-        if self.api_worker:
-            self.api_worker.deleteLater()
-            self.api_worker = None
+        # Worker deletion is scheduled in on_api_worker_batch_finished
+        self.api_worker = None
 
         if self.api_thread:
+            # Ensure the thread is fully stopped before scheduling deletion
+            self.api_thread.wait()
             self.api_thread.deleteLater()
             self.api_thread = None
 
@@ -2363,6 +2364,9 @@ class MainWindow(QMainWindow):
 
         if self.api_worker:
             self.api_worker.stop_processing() # Ensure its _is_running flag is false
+            # Schedule worker deletion while the thread's event loop is still running
+            # This ensures the worker object is properly cleaned up before the thread quits
+            self.api_worker.deleteLater()
 
         if self.api_thread:
             logging.info("Worker batch finished. Requesting QThread to quit its event loop.")

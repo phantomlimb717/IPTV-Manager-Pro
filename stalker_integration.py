@@ -314,7 +314,7 @@ class StalkerPortal:
         """
         Fetches episodes for a series. Handles seasons if present.
         """
-        # First try fetching directly with movie_id (some portals return flat list)
+        # 1. Try to get seasons first (season_id=0 usually returns seasons list)
         params = {
             'type': 'vod',
             'action': 'get_ordered_list',
@@ -331,31 +331,49 @@ class StalkerPortal:
             items = data.get('js', {}).get('data', [])
 
             if not items:
+                # Some portals might need category_id set? Or maybe it's a flat list directly?
+                # Retry without season_id might be needed but usually season_id=0 is the entry point.
                 return []
 
-            # Check if result is seasons or episodes
-            # Heuristic: Check for 'cmd' (playable) vs just 'id'/'name'
-            has_cmd = any('cmd' in x for x in items)
+            # Determine if 'items' are Seasons or Episodes
+            # Seasons usually have 'is_series': 0 or just don't have 'cmd'
+            # Episodes have 'cmd'
 
-            if has_cmd:
+            # Heuristic: Check for 'cmd' (playable)
+            first_item = items[0]
+            if 'cmd' in first_item and first_item['cmd']:
+                # It's a flat list of episodes
                 return items
 
-            # Assume seasons, iterate and fetch
+            # It's likely a list of seasons
+            # Iterate through seasons to get episodes
             for season in items:
-                s_id = season.get('id')
-                if not s_id: continue
+                season_id = season.get('id')
+                season_name = season.get('name', str(season_id))
 
+                # Extract season number if possible (e.g. "Season 1")
+                season_num = 0
+                import re
+                match = re.search(r'(\d+)', season_name)
+                if match:
+                    season_num = int(match.group(1))
+
+                # Fetch episodes for this season
                 p2 = params.copy()
-                p2['season_id'] = s_id
+                p2['season_id'] = season_id
+
                 try:
                     r2 = self.session.get(self.api_url, params=p2, headers=headers, timeout=5)
                     d2 = r2.json().get('js', {}).get('data', [])
+
                     for ep in d2:
-                        ep['season_num'] = season.get('season_number', season.get('name')) # Try to get season num
-                    episodes.extend(d2)
-                except Exception:
-                    pass
+                        ep['season_num'] = season_num
+                        episodes.append(ep)
+                except Exception as e:
+                    logger.error(f"Error fetching season {season_id}: {e}")
+
             return episodes
+
         except Exception as e:
             logger.error(f"Error fetching episodes for series {series_id}: {e}")
             return []

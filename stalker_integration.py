@@ -22,7 +22,7 @@ class StalkerPortal:
     def __init__(self, portal_url, mac_address):
         self.mac_address = mac_address.upper()
         self.portal_url = self._normalize_url(portal_url)
-        self.api_url = f"{self.portal_url}{STALKER_API_PATH}"
+        self.api_url = f"{self.portal_url}{STALKER_API_PATH}" # Default, but will be updated if handshake finds another
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -48,11 +48,19 @@ class StalkerPortal:
     def _normalize_url(self, url):
         if not url: return ""
         url = url.strip()
-        suffixes = ['/c/', '/c', '/portal.php', '/stalker_portal/server/load.php', '/server/load.php']
+        # Order matters: strip longer suffixes first
+        suffixes = ['/stalker_portal/c/', '/stalker_portal/c', '/c/', '/c',
+                    '/portal.php', '/stalker_portal/server/load.php', '/server/load.php']
         for suffix in suffixes:
             if url.endswith(suffix):
                 url = url[:-len(suffix)]
                 break
+
+        # Also strip trailing /stalker_portal if present to avoid duplication
+        # because handshake adds it back in the first endpoint option.
+        if url.endswith('/stalker_portal'):
+             url = url[:-len('/stalker_portal')]
+
         return url.rstrip('/')
 
     def _generate_serial(self, mac):
@@ -72,38 +80,59 @@ class StalkerPortal:
     def handshake(self):
         """
         Performs the initial handshake to obtain a token.
-        Implements fallback logic for strict portals.
+        Implements fallback logic for strict portals and multiple endpoints.
         """
+        endpoints = [
+            "/stalker_portal/server/load.php",
+            "/server/load.php",
+            "/portal.php",
+            "/c/portal.php"
+        ]
+
         params = {'type': 'stb', 'action': 'handshake', 'token': '', 'JsHttpRequest': '1-xml'}
 
-        try:
-            # 1. Try standard handshake
-            resp = self.session.get(self.api_url, params=params, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                token = data.get('js', {}).get('token')
-                if token:
-                    self.token = token
-                    self.session.cookies.update({'token': token})
-                    return True
-
-            # 2. Fallback: Generate token manually if 404 or no token returned
-            if resp.status_code in [404, 403] or not self.token:
-                logger.info("Standard handshake failed, trying fallback with generated token.")
-                token = self._generate_token()
-                prehash = self._generate_prehash(token, self.mac_address)
-
-                params['token'] = token
-                params['prehash'] = prehash
-
-                resp = self.session.get(self.api_url, params=params, timeout=10)
+        for endpoint in endpoints:
+            current_api_url = f"{self.portal_url}{endpoint}"
+            try:
+                # 1. Try standard handshake
+                resp = self.session.get(current_api_url, params=params, timeout=10)
                 if resp.status_code == 200:
-                    self.token = token
-                    self.session.cookies.update({'token': token})
-                    return True
+                    try:
+                        data = resp.json()
+                        token = data.get('js', {}).get('token')
+                        if token:
+                            self.token = token
+                            self.session.cookies.update({'token': token})
+                            self.api_url = current_api_url # Store working endpoint
+                            return True
+                    except json.JSONDecodeError:
+                        pass
 
-        except Exception as e:
-            logger.error(f"Handshake error: {e}")
+                # 2. Fallback: Generate token manually if 404 or no token returned
+                if resp.status_code in [404, 403] or not self.token:
+                    logger.info(f"Standard handshake failed for {endpoint}, trying fallback with generated token.")
+                    token = self._generate_token()
+                    prehash = self._generate_prehash(token, self.mac_address)
+
+                    fallback_params = params.copy()
+                    fallback_params['token'] = token
+                    fallback_params['prehash'] = prehash
+
+                    resp = self.session.get(current_api_url, params=fallback_params, timeout=10)
+                    if resp.status_code == 200:
+                        try:
+                            # Verify valid JSON response
+                            resp.json()
+                            self.token = token
+                            self.session.cookies.update({'token': token})
+                            self.api_url = current_api_url # Store working endpoint
+                            return True
+                        except json.JSONDecodeError:
+                            pass
+
+            except Exception as e:
+                logger.error(f"Handshake error for {endpoint}: {e}")
+                continue
 
         return False
 

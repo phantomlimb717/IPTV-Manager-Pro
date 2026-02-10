@@ -2285,8 +2285,9 @@ class MainWindow(QMainWindow):
         self.api_thread.started.connect(self.api_worker.initialize_session)
 
         self.api_thread.finished.connect(self.api_worker.cleanup_session)
-        self.api_thread.finished.connect(self.api_worker.deleteLater)
-        self.api_thread.finished.connect(self.api_thread.deleteLater)
+        # Avoid double deletion or race conditions by relying on Python GC or careful parenting
+        # self.api_thread.finished.connect(self.api_worker.deleteLater)
+        # self.api_thread.finished.connect(self.api_thread.deleteLater)
         self.api_thread.finished.connect(self._clear_thread_references)
 
         logging.debug("Starting API thread.")
@@ -2339,8 +2340,15 @@ class MainWindow(QMainWindow):
     def _clear_thread_references(self):
         logging.info("QThread.finished received. Clearing Python references and re-enabling UI.")
 
-        self.api_worker = None
-        self.api_thread = None
+        # Safe cleanup
+        if self.api_worker:
+            self.api_worker.deleteLater()
+            self.api_worker = None
+
+        if self.api_thread:
+            self.api_thread.deleteLater()
+            self.api_thread = None
+
         self._is_checking_api = False
 
         self.progress_bar.setVisible(False)

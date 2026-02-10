@@ -505,7 +505,7 @@ class IPTVChecker:
                             break
 
                 # Check if expired
-                if result['expiry_date_ts'] and result['expiry_date_ts'] < time.time():
+                if result.get('expiry_date_ts') and result['expiry_date_ts'] < time.time():
                     result['api_status'] = 'Expired'
 
         except Exception as e:

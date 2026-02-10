@@ -497,6 +497,13 @@ class IPTVChecker:
                 # Parse Status
                 result['api_status'] = 'Active'
 
+                # Extract details
+                if 'playback_limit' in profile:
+                    try:
+                        result['max_connections'] = int(profile['playback_limit'])
+                    except (ValueError, TypeError):
+                        pass
+
                 # Expiry
                 exp_date_keys = ['expire_date', 'expiration_date', 'expire_billing_date', 'phone']
                 for k in exp_date_keys:
@@ -511,11 +518,74 @@ class IPTVChecker:
                 if result.get('expiry_date_ts') and result['expiry_date_ts'] < time.time():
                     result['api_status'] = 'Expired'
 
+                # Get Counts
+                counts = await self.get_stalker_counts(session, working_endpoint, token, mac_address)
+                result.update(counts)
+
         except Exception as e:
             result['api_message'] = f"Stalker Error: {str(e)}"
             logging.error(f"Stalker Check Critical Error: {e}")
 
         return result
+
+    async def get_stalker_counts(self, session, api_url, token, mac_address):
+        """Fetches Live, VOD, and Series counts concurrently for Stalker."""
+
+        # Stalker types: itv (Live), vod (Movies), series (Series)
+        # To get count, we usually ask for ordered list page 1 and read 'total_items'
+
+        actions = {
+            'live_streams_count': 'itv',
+            'movies_count': 'vod',
+            'series_count': 'series'
+        }
+
+        tasks = []
+        for key, type_val in actions.items():
+            tasks.append(self._fetch_stalker_count(session, api_url, token, mac_address, type_val, key))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        counts = {}
+        for res in results:
+            if isinstance(res, dict):
+                counts.update(res)
+        return counts
+
+    async def _fetch_stalker_count(self, session, api_url, token, mac, type_val, key):
+        headers = {
+            'User-Agent': MAG_USER_AGENT,
+            'Authorization': f'Bearer {token}',
+            'Referer': api_url,
+            'Cookie': f"mac={mac}; stb_lang=en; timezone={DEFAULT_TZ}; token={token};"
+        }
+
+        # We try to get page 1 of the ordered list. The response usually contains total_items.
+        params = {
+            'type': type_val,
+            'action': 'get_ordered_list',
+            'p': 1,
+            'JsHttpRequest': '1-xml'
+        }
+
+        if type_val == 'itv':
+             # For Live TV, sometimes get_all_channels or similar is better, but get_ordered_list is standard
+             params['genre'] = 0 # All genres
+        elif type_val == 'vod':
+             params['category'] = 0
+        elif type_val == 'series':
+             params['category'] = 0
+
+        try:
+            async with session.get(api_url, params=params, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    js_data = data.get('js', {})
+                    if 'total_items' in js_data:
+                        return {key: int(js_data['total_items'])}
+        except Exception:
+            pass
+        return {key: 0}
 
     async def _stalker_handshake(self, session, api_url, mac_address):
         # api_url is already the full endpoint (e.g., http://.../load.php)

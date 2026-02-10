@@ -1127,7 +1127,8 @@ class PlaylistFilterProxyModel(QSortFilterProxyModel):
 class PlaylistBrowserDialog(QDialog):
     def __init__(self, entry_data, parent=None):
         super().__init__(parent)
-        self.entry_data = entry_data
+        # Convert sqlite3.Row to dict to allow .get() usage and ensure safe threading
+        self.entry_data = dict(entry_data)
         self.media_player_manager = MediaPlayerManager()
         self.category_data = {} # Renamed from playlist_data
         self.category_worker_thread = None

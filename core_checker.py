@@ -491,6 +491,9 @@ class IPTVChecker:
                 result['success'] = True
                 result['raw_user_info'] = json.dumps(profile)
 
+                # DEBUG: Log profile to see date formats
+                logging.debug(f"Stalker Profile Data: {json.dumps(profile)}")
+
                 # Parse Status
                 result['api_status'] = 'Active'
 

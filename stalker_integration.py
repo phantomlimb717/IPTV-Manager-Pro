@@ -377,3 +377,9 @@ class StalkerPortal:
         except Exception as e:
             logger.error(f"Error fetching episodes for series {series_id}: {e}")
             return []
+
+    def get_cookie_string(self):
+        """
+        Returns the session cookies formatted as a string for HTTP headers.
+        """
+        return "; ".join([f"{k}={v}" for k, v in self.session.cookies.get_dict().items()])

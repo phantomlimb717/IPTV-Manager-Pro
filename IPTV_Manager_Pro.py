@@ -909,7 +909,7 @@ class StalkerStreamLoaderWorker(QObject):
             self.finished.emit()
 
 class StalkerPlaybackWorker(QObject):
-    link_ready = Signal(str)
+    link_ready = Signal(str, str) # url, cookies
     error_occurred = Signal(str)
     finished = Signal()
 
@@ -934,7 +934,9 @@ class StalkerPlaybackWorker(QObject):
             # stream_id passed here is the 'cmd' string for Live TV, or ID/cmd for VOD.
 
             real_url = portal.create_link(stalker_type, self.stream_id)
-            self.link_ready.emit(real_url)
+            cookies = portal.get_cookie_string()
+
+            self.link_ready.emit(str(real_url), str(cookies))
 
         except Exception as e:
             self.error_occurred.emit(str(e))
@@ -1475,8 +1477,8 @@ class PlaylistBrowserDialog(QDialog):
         stream_url = f"{server}/{stream_type}/{username}/{password}/{stream_id}{extension}"
         self.media_player_manager.play_stream(stream_url, self, referer_url=server)
 
-    @Slot(str)
-    def launch_stalker_player(self, url):
+    @Slot(str, str)
+    def launch_stalker_player(self, url, cookies):
         self.status_label.setText("Launching player...")
         if hasattr(self, 'playback_thread') and self.playback_thread:
             self.playback_thread.quit()
@@ -1487,7 +1489,7 @@ class PlaylistBrowserDialog(QDialog):
         if not referer.endswith('/c/'):
              referer = referer.rstrip('/') + '/c/'
 
-        self.media_player_manager.play_stream(url, self, referer_url=referer)
+        self.media_player_manager.play_stream(url, self, referer_url=referer, cookies=cookies)
 
     def play_episode(self, stream_id, container_extension=None):
         server = self.entry_data['server_base_url']

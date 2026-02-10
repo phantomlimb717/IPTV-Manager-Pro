@@ -5,6 +5,9 @@ import json
 import time
 import re
 import subprocess
+import hashlib
+import random
+import string
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 
@@ -13,6 +16,11 @@ USER_AGENT = 'IPTV Manager Pro/0.3 (okhttp/3.12.1)'
 API_TIMEOUT = 10
 DOWNLOAD_TIMEOUT = 10
 FFMPEG_TIMEOUT = 20  # Increased to allow for longer analysis
+
+# Stalker Constants
+STALKER_API_PATH = "/stalker_portal/server/load.php"
+DEFAULT_TZ = "Europe/London"
+MAG_USER_AGENT = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
 
 class IPTVChecker:
     """
@@ -378,6 +386,23 @@ class IPTVChecker:
 
         return False
 
+    def _generate_token(self):
+        return ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
+
+    def _generate_prehash(self, token, mac):
+        return hashlib.sha1(token.encode()).hexdigest()
+
+    def _normalize_stalker_url(self, url):
+        if not url: return ""
+        url = url.strip()
+        # Remove common suffixes
+        suffixes = ['/c/', '/c', '/portal.php', '/stalker_portal/server/load.php', '/server/load.php']
+        for suffix in suffixes:
+            if url.endswith(suffix):
+                url = url[:-len(suffix)]
+                break # Only remove one suffix
+        return url.rstrip('/')
+
     async def check_stalker_portal(self, portal_url, mac_address):
         """
         Checks a Stalker/MAG portal.
@@ -389,35 +414,47 @@ class IPTVChecker:
             result['api_message'] = "Missing Portal URL or MAC"
             return result
 
+        # Normalize URL
+        portal_url = self._normalize_stalker_url(portal_url)
+
         try:
             # 1. Handshake / Get Token
             token = await self._stalker_handshake(session, portal_url, mac_address)
             if not token:
-                result['api_message'] = "Stalker Handshake Failed"
+                result['api_message'] = "Handshake Failed (Invalid MAC or URL)"
                 return result
 
-            # 2. Get Account Info
-            info = await self._stalker_get_info(session, portal_url, token, mac_address)
-            if not info:
-                result['api_message'] = "Failed to retrieve account info"
+            # 2. Get Profile (Verify Token)
+            profile = await self._stalker_get_profile(session, portal_url, token, mac_address)
+
+            # If profile is empty, auth failed
+            if not profile or not profile.get('id'):
+                result['api_message'] = "Profile fetch failed (Auth Invalid)"
                 return result
 
+            # 3. Success
             result['success'] = True
-            result['raw_user_info'] = json.dumps(info)
+            result['raw_user_info'] = json.dumps(profile)
 
-            # Logic to determine status from info
-            # Stalker portals vary wildly.
-            status_val = str(info.get('status', ''))
-
-            if status_val == '1': result['api_status'] = 'Active'
-            elif status_val in ['0', '2']: result['api_status'] = 'Inactive'
-            else: result['api_status'] = 'Online' # Fallback
+            # Parse Status
+            # Usually Stalker doesn't return a simple 'status' field in get_profile like Xtream.
+            # We assume Active if we got the profile.
+            result['api_status'] = 'Active'
 
             # Expiry
-            exp_date_raw = info.get('exp_date') or info.get('expire_date') or info.get('phone')
-            if exp_date_raw:
-                result['expiry_date_ts'] = self._parse_stalker_date(exp_date_raw)
+            # Try multiple fields
+            exp_date_keys = ['expire_date', 'expiration_date', 'expire_billing_date', 'phone']
+            # Note: 'phone' is sometimes hijacked for expiry in old panels
 
+            for k in exp_date_keys:
+                val = profile.get(k)
+                if val and str(val) != '0' and str(val) != '':
+                    ts = self._parse_stalker_date(val)
+                    if ts:
+                        result['expiry_date_ts'] = ts
+                        break
+
+            # Check if expired
             if result['expiry_date_ts'] and result['expiry_date_ts'] < time.time():
                 result['api_status'] = 'Expired'
 
@@ -427,41 +464,92 @@ class IPTVChecker:
         return result
 
     async def _stalker_handshake(self, session, portal_url, mac_address):
-        url = f"{portal_url.rstrip('/')}/portal.php"
+        # 1. Try standard endpoint first
+        api_url = f"{portal_url}{STALKER_API_PATH}"
+
+        # Basic Headers
         headers = {
-            'User-Agent': 'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3',
-            'Authorization': f'Bearer {mac_address}',
-            'Referer': f"{portal_url.rstrip('/')}/c/"
+            'User-Agent': MAG_USER_AGENT,
+            'Referer': f"{portal_url}/stalker_portal/c/",
+            'Cookie': f"mac={mac_address}; stb_lang=en; timezone={DEFAULT_TZ};"
         }
-        cookies = {'mac': mac_address}
-        params = {'action': 'handshake', 'type': 'stb', 'token': '', 'JsHttpRequest': '1-xml'}
+
+        # Params for initial handshake
+        params = {'type': 'stb', 'action': 'handshake', 'token': '', 'JsHttpRequest': '1-xml'}
 
         try:
-            async with session.get(url, params=params, headers=headers, cookies=cookies) as resp:
+            async with session.get(api_url, params=params, headers=headers) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    return data.get('js', {}).get('token')
+                    data = await resp.json(content_type=None) # Handle text/html responses
+                    token = data.get('js', {}).get('token')
+                    if token: return token
         except Exception as e:
-            logging.debug(f"Stalker handshake error: {e}")
+            logging.debug(f"Stalker Handshake Error: {e}")
+
+        # Fallback: Generate token manually
+        try:
+            token = self._generate_token()
+            prehash = self._generate_prehash(token, mac_address)
+
+            # Update params
+            params['token'] = token
+            params['prehash'] = prehash
+
+            # Retry
+            async with session.get(api_url, params=params, headers=headers) as resp2:
+                if resp2.status == 200:
+                    # We blindly trust our generated token works if we get a 200 OK JSON
+                    # The real test is the next profile fetch.
+                    return token
+        except Exception as e:
+            logging.debug(f"Stalker Handshake Fallback Error: {e}")
+
         return None
 
-    async def _stalker_get_info(self, session, portal_url, token, mac_address):
-        url = f"{portal_url.rstrip('/')}/portal.php"
+    async def _stalker_get_profile(self, session, portal_url, token, mac_address):
+        api_url = f"{portal_url}{STALKER_API_PATH}"
+
         headers = {
-            'User-Agent': 'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3',
+            'User-Agent': MAG_USER_AGENT,
             'Authorization': f'Bearer {token}',
-            'Referer': f"{portal_url.rstrip('/')}/c/"
+            'Referer': f"{portal_url}/stalker_portal/c/",
+            'Cookie': f"mac={mac_address}; stb_lang=en; timezone={DEFAULT_TZ}; token={token};"
         }
-        cookies = {'mac': mac_address}
-        params = {'type': 'account_info', 'action': 'get_main_info', 'JsHttpRequest': '1-xml'}
+
+        # Params to mimic a real MAG box request
+        device_id = hashlib.sha256(mac_address.encode()).hexdigest().upper()
+        device_id2 = device_id
+        signature = hashlib.sha256(f"{mac_address}{device_id}{device_id2}".encode()).hexdigest().upper()
+
+        params = {
+            'type': 'stb',
+            'action': 'get_profile',
+            'hd': '1',
+            'ver': 'ImageDescription: 0.2.18-r23-250; ImageDate: Fri Jan 15 15:00:00 2021; PORTAL version: 5.6.1; API Version: JS API version: 343; STB API version: 146; Player Engine version: 0x58c',
+            'num_banks': '2',
+            'sn': '0000000000000',
+            'stb_type': 'MAG250',
+            'client_type': 'STB',
+            'image_version': '218',
+            'video_out': 'hdmi',
+            'device_id': device_id,
+            'device_id2': device_id2,
+            'signature': signature,
+            'auth_second_step': '1',
+            'hw_version': '1.7-BD-00',
+            'not_valid_token': '0',
+            'timestamp': int(time.time()),
+            'JsHttpRequest': '1-xml'
+        }
 
         try:
-            async with session.get(url, params=params, headers=headers, cookies=cookies) as resp:
+            async with session.get(api_url, params=params, headers=headers) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
+                    data = await resp.json(content_type=None)
                     return data.get('js', {})
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug(f"Stalker Get Profile Error: {e}")
+
         return None
 
     def _parse_stalker_date(self, date_str):

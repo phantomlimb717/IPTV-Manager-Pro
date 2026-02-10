@@ -49,6 +49,8 @@ except ImportError:
 
 from companion_utils import MediaPlayerManager
 from core_checker import IPTVChecker
+from stalker_integration import StalkerPortal
+from epg_manager import EpgManager
 
 # --- Resource Path Helper for PyInstaller ---
 def resource_path(relative_path):
@@ -798,6 +800,168 @@ class BulkEditCategoryDialog(QDialog):
         return self.category_combo.currentText()
 
 
+class StalkerCategoryLoaderWorker(QObject):
+    data_ready = Signal(dict)
+    error_occurred = Signal(str)
+    finished = Signal()
+
+    def __init__(self, entry_data):
+        super().__init__()
+        self.entry_data = entry_data
+
+    @Slot()
+    def run(self):
+        try:
+            portal = StalkerPortal(
+                self.entry_data['portal_url'],
+                self.entry_data['mac_address']
+            )
+            if not portal.handshake():
+                 raise Exception("Handshake failed")
+
+            portal.get_profile()
+
+            data = {
+                'live': portal.get_categories("itv"),
+                'movie': portal.get_categories("vod"),
+                'series': portal.get_categories("series")
+            }
+
+            final_data = {'live': [], 'movie': [], 'series': []}
+
+            for k, v in data.items():
+                for item in v:
+                    final_data[k].append({
+                        'category_id': item.get('id'),
+                        'category_name': item.get('title')
+                    })
+
+            self.data_ready.emit(final_data)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+        finally:
+            self.finished.emit()
+
+class StalkerStreamLoaderWorker(QObject):
+    data_ready = Signal(list)
+    error_occurred = Signal(str)
+    finished = Signal()
+
+    def __init__(self, entry_data, category_id, stream_type):
+        super().__init__()
+        self.entry_data = entry_data
+        self.category_id = category_id
+        self.stream_type = stream_type
+
+    @Slot()
+    def run(self):
+        try:
+            portal = StalkerPortal(
+                self.entry_data['portal_url'],
+                self.entry_data['mac_address']
+            )
+            if not portal.handshake():
+                 raise Exception("Handshake failed")
+            portal.get_profile()
+
+            stalker_type = "itv" if self.stream_type == 'live' else "vod" if self.stream_type == 'movie' else "series"
+            streams = portal.get_streams(stalker_type, self.category_id)
+
+            mapped_streams = []
+            for s in streams:
+                # Use 'cmd' as ID if available for Live/VOD, use 'id' for Series navigation
+                if stalker_type == 'series':
+                    s_id = s.get('id')
+                else:
+                    s_id = s.get('cmd') or s.get('id')
+
+                mapped_streams.append({
+                    'name': s.get('name') or s.get('title'),
+                    'stream_id': s_id,
+                    'container_extension': 'ts' if stalker_type == 'itv' else 'mp4',
+                    'series_id': s.get('id') if stalker_type == 'series' else None, # Only for series navigation
+                    'epg_id': s.get('id') if stalker_type == 'itv' else None, # Numeric ID for EPG
+                    'cmd': s.get('cmd')
+                })
+
+            self.data_ready.emit(mapped_streams)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+        finally:
+            self.finished.emit()
+
+class StalkerPlaybackWorker(QObject):
+    link_ready = Signal(str)
+    error_occurred = Signal(str)
+    finished = Signal()
+
+    def __init__(self, entry_data, stream_id, stream_type):
+        super().__init__()
+        self.entry_data = entry_data
+        self.stream_id = stream_id
+        self.stream_type = stream_type
+
+    @Slot()
+    def run(self):
+        try:
+            portal = StalkerPortal(
+                self.entry_data['portal_url'],
+                self.entry_data['mac_address']
+            )
+            if not portal.handshake():
+                 raise Exception("Handshake failed")
+            portal.get_profile()
+
+            stalker_type = "itv" if self.stream_type == 'live' else "vod"
+            # stream_id passed here is the 'cmd' string for Live TV, or ID/cmd for VOD.
+
+            real_url = portal.create_link(stalker_type, self.stream_id)
+            self.link_ready.emit(real_url)
+
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+        finally:
+             self.finished.emit()
+
+class StalkerSeriesInfoWorker(QObject):
+    data_ready = Signal(object)
+    error_occurred = Signal(str)
+    finished = Signal()
+
+    def __init__(self, entry_data, series_id):
+        super().__init__()
+        self.entry_data = entry_data
+        self.series_id = series_id
+
+    @Slot()
+    def run(self):
+        try:
+            portal = StalkerPortal(
+                self.entry_data['portal_url'],
+                self.entry_data['mac_address']
+            )
+            if not portal.handshake(): raise Exception("Handshake failed")
+            portal.get_profile()
+
+            episodes = portal.get_series_episodes(self.series_id)
+
+            mapped_episodes = []
+            for ep in episodes:
+                mapped_episodes.append({
+                    'title': ep.get('name') or ep.get('title'),
+                    'id': ep.get('cmd') or ep.get('id'), # Use cmd for playback!
+                    'season': ep.get('season_num', 0),
+                    'episode_num': ep.get('episode_number', 0),
+                    'container_extension': 'mp4'
+                })
+
+            self.data_ready.emit({'info': {'name': 'Series'}, 'episodes': mapped_episodes})
+
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+        finally:
+            self.finished.emit()
+
 class CategoryLoaderWorker(QObject):
     data_ready = Signal(dict)
     error_occurred = Signal(str)
@@ -984,8 +1148,8 @@ class PlaylistBrowserDialog(QDialog):
         self.status_label = QLabel("Loading categories...")
 
         # Models for the table
-        self.stream_model = QStandardItemModel(0, 2) # Name, Stream ID (hidden)
-        self.stream_model.setHorizontalHeaderLabels(["Name", "Stream ID"])
+        self.stream_model = QStandardItemModel(0, 3) # Name, Stream ID (hidden), EPG
+        self.stream_model.setHorizontalHeaderLabels(["Name", "Stream ID", "EPG"])
         self.proxy_model = PlaylistFilterProxyModel()
         self.proxy_model.setSourceModel(self.stream_model)
         self.proxy_model.setFilterKeyColumn(0)
@@ -1033,7 +1197,14 @@ class PlaylistBrowserDialog(QDialog):
 
     def load_playlist_data(self):
         # This is now for loading categories
-        self.category_worker = CategoryLoaderWorker(self.entry_data)
+        account_type = self.entry_data.get('account_type', 'xc')
+
+        if account_type == 'stalker':
+            self.category_worker = StalkerCategoryLoaderWorker(self.entry_data)
+            self.setup_epg_manager()
+        else:
+            self.category_worker = CategoryLoaderWorker(self.entry_data)
+
         self.category_worker_thread = QThread()
         self.category_worker.moveToThread(self.category_worker_thread)
         self.category_worker_thread.started.connect(self.category_worker.run)
@@ -1042,6 +1213,43 @@ class PlaylistBrowserDialog(QDialog):
         self.category_worker.finished.connect(self.category_worker_thread.quit)
         self.category_worker.finished.connect(self.category_worker.deleteLater)
         self.category_worker_thread.start()
+
+    def setup_epg_manager(self):
+        portal_url = self.entry_data.get('portal_url')
+        mac_address = self.entry_data.get('mac_address')
+        if portal_url and mac_address:
+            self.epg_manager = EpgManager(portal_url, mac_address)
+            self.epg_manager.epg_ready.connect(self.update_epg_data)
+            self.epg_manager.start()
+
+    @Slot(str, list)
+    def update_epg_data(self, channel_id, epg_list):
+        if not epg_list: return
+
+        # Get current program
+        now = time.time()
+        current_prog_name = ""
+
+        for prog in epg_list:
+            try:
+                start = int(prog.get('start_timestamp', 0))
+                end = int(prog.get('stop_timestamp', 0))
+                if start <= now < end:
+                    current_prog_name = prog.get('name', '')
+                    break
+            except: pass
+
+        if not current_prog_name: return
+
+        # Find item in model
+        for row in range(self.stream_model.rowCount()):
+            id_item = self.stream_model.item(row, 1)
+            # Retrieve stored EPG ID
+            stored_epg_id = id_item.data(Qt.UserRole + 2)
+            if stored_epg_id == channel_id:
+                epg_item = QStandardItem(current_prog_name)
+                self.stream_model.setItem(row, 2, epg_item)
+                return
 
     @Slot(dict)
     def on_categories_ready(self, data):
@@ -1118,7 +1326,12 @@ class PlaylistBrowserDialog(QDialog):
         self.stream_model.removeRows(0, self.stream_model.rowCount())
 
         # Start the stream loader worker
-        self.stream_worker = StreamLoaderWorker(self.entry_data, cat_id, stream_type)
+        account_type = self.entry_data.get('account_type', 'xc')
+        if account_type == 'stalker':
+            self.stream_worker = StalkerStreamLoaderWorker(self.entry_data, cat_id, stream_type)
+        else:
+            self.stream_worker = StreamLoaderWorker(self.entry_data, cat_id, stream_type)
+
         self.stream_worker_thread = QThread()
         self.stream_worker.moveToThread(self.stream_worker_thread)
         self.stream_worker_thread.started.connect(self.stream_worker.run)
@@ -1148,15 +1361,25 @@ class PlaylistBrowserDialog(QDialog):
                 name = stream.get('title')
 
             container_extension = stream.get('container_extension')
+            epg_id = stream.get('epg_id')
 
             name_item = QStandardItem(name)
             id_item = QStandardItem(stream_id)
+            epg_item = QStandardItem("") # Empty initially
 
             # Store container_extension in UserRole of id_item
             if container_extension:
                 id_item.setData(container_extension, Qt.UserRole + 1) # UserRole + 1 for extension
 
-            self.stream_model.appendRow([name_item, id_item])
+            # Store EPG ID
+            if epg_id:
+                id_item.setData(str(epg_id), Qt.UserRole + 2)
+
+            self.stream_model.appendRow([name_item, id_item, epg_item])
+
+            # Trigger EPG fetch if we have an EPG ID and manager
+            if epg_id and hasattr(self, 'epg_manager') and self.epg_manager.isRunning():
+                self.epg_manager.request_epg(str(epg_id))
 
         self.status_label.setText(f"Loaded {len(streams)} items.")
         self.stream_worker_thread.quit()
@@ -1202,6 +1425,22 @@ class PlaylistBrowserDialog(QDialog):
             QMessageBox.warning(self, "Error", f"Could not determine stream type for category '{top_level_category_name}'.")
 
     def play_vod_or_live(self, stream_id, category, container_extension=None):
+        account_type = self.entry_data.get('account_type', 'xc')
+
+        if account_type == 'stalker':
+            stream_type = 'movie' if category == 'Movies' else 'live'
+            self.status_label.setText(f"Generating Stalker link for {stream_id}...")
+
+            self.playback_worker = StalkerPlaybackWorker(self.entry_data, stream_id, stream_type)
+            self.playback_thread = QThread()
+            self.playback_worker.moveToThread(self.playback_thread)
+            self.playback_worker.link_ready.connect(self.launch_stalker_player)
+            self.playback_worker.error_occurred.connect(self.on_load_error)
+            self.playback_thread.started.connect(self.playback_worker.run)
+            self.playback_thread.finished.connect(self.playback_thread.deleteLater)
+            self.playback_thread.start()
+            return
+
         server = self.entry_data['server_base_url']
         username = self.entry_data['username']
         password = self.entry_data['password']
@@ -1215,6 +1454,16 @@ class PlaylistBrowserDialog(QDialog):
 
         stream_url = f"{server}/{stream_type}/{username}/{password}/{stream_id}{extension}"
         self.media_player_manager.play_stream(stream_url, self, referer_url=server)
+
+    @Slot(str)
+    def launch_stalker_player(self, url):
+        self.status_label.setText("Launching player...")
+        if hasattr(self, 'playback_thread') and self.playback_thread:
+            self.playback_thread.quit()
+
+        portal_url = self.entry_data.get('portal_url', '')
+        # Pass portal URL as referer for security
+        self.media_player_manager.play_stream(url, self, referer_url=portal_url)
 
     def play_episode(self, stream_id, container_extension=None):
         server = self.entry_data['server_base_url']
@@ -1233,7 +1482,13 @@ class PlaylistBrowserDialog(QDialog):
             self.series_info_thread.wait()
 
         self.status_label.setText(f"Fetching episodes for series ID: {series_id}...")
-        self.series_worker = SeriesInfoWorker(self.entry_data, series_id)
+
+        account_type = self.entry_data.get('account_type', 'xc')
+        if account_type == 'stalker':
+            self.series_worker = StalkerSeriesInfoWorker(self.entry_data, series_id)
+        else:
+            self.series_worker = SeriesInfoWorker(self.entry_data, series_id)
+
         self.series_info_thread = QThread()
         self.series_worker.moveToThread(self.series_info_thread)
         self.series_info_thread.started.connect(self.series_worker.run)
@@ -1308,6 +1563,9 @@ class PlaylistBrowserDialog(QDialog):
         if self.series_info_thread and self.series_info_thread.isRunning():
             self.series_info_thread.quit()
             self.series_info_thread.wait()
+        if hasattr(self, 'epg_manager') and self.epg_manager.isRunning():
+            self.epg_manager.stop()
+            self.epg_manager.wait()
         super().closeEvent(event)
 
 

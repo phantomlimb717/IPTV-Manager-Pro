@@ -413,7 +413,13 @@ class IPTVChecker:
         """
         Checks a Stalker/MAG portal using an isolated session and smart fallback logic.
         """
-        result = {'success': False, 'api_status': 'Error'}
+        # Initialize result with required keys to prevent KeyErrors later
+        result = {
+            'success': False,
+            'api_status': 'Error',
+            'api_message': 'Check Failed',
+            'expiry_date_ts': None
+        }
 
         if not portal_url or not mac_address:
             result['api_message'] = "Missing Portal URL or MAC"

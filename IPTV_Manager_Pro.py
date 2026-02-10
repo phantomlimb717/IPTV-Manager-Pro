@@ -49,7 +49,7 @@ except ImportError:
 
 from companion_utils import MediaPlayerManager
 from core_checker import IPTVChecker
-from stalker_integration import StalkerPortal
+from stalker_integration import StalkerPortal, MAG_USER_AGENT
 from epg_manager import EpgManager
 
 # --- Resource Path Helper for PyInstaller ---
@@ -1155,6 +1155,7 @@ class PlaylistBrowserDialog(QDialog):
         self.category_worker_thread = None
         self.stream_worker_thread = None
         self.series_info_thread = None
+        self.playback_thread = None
         self.original_window_title = f"Playlist for {self.entry_data['name']}"
 
         self.setWindowTitle(self.original_window_title)
@@ -1480,8 +1481,9 @@ class PlaylistBrowserDialog(QDialog):
     @Slot(str, str)
     def launch_stalker_player(self, url, cookies):
         self.status_label.setText("Launching player...")
-        if hasattr(self, 'playback_thread') and self.playback_thread:
+        if self.playback_thread:
             self.playback_thread.quit()
+            self.playback_thread.wait() # Ensure it stops
 
         # Ensure Referer ends with /c/ as per MAG standard
         portal_url = self.entry_data.get('portal_url', '')
@@ -1489,7 +1491,7 @@ class PlaylistBrowserDialog(QDialog):
         if not referer.endswith('/c/'):
              referer = referer.rstrip('/') + '/c/'
 
-        self.media_player_manager.play_stream(url, self, referer_url=referer, cookies=cookies)
+        self.media_player_manager.play_stream(url, self, referer_url=referer, cookies=cookies, user_agent=MAG_USER_AGENT)
 
     def play_episode(self, stream_id, container_extension=None):
         server = self.entry_data['server_base_url']
@@ -1589,6 +1591,10 @@ class PlaylistBrowserDialog(QDialog):
         if self.series_info_thread and self.series_info_thread.isRunning():
             self.series_info_thread.quit()
             self.series_info_thread.wait()
+        if self.playback_thread and self.playback_thread.isRunning():
+            self.playback_thread.quit()
+            self.playback_thread.wait()
+
         if hasattr(self, 'epg_manager') and self.epg_manager.isRunning():
             self.epg_manager.stop()
             self.epg_manager.wait()

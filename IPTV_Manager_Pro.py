@@ -1454,13 +1454,23 @@ class PlaylistBrowserDialog(QDialog):
             stream_type = 'movie' if category == 'Movies' else 'live'
             self.status_label.setText(f"Generating Stalker link for {stream_id}...")
 
+            # Clean up previous playback thread if running
+            if self.playback_thread and self.playback_thread.isRunning():
+                self.playback_thread.quit()
+                self.playback_thread.wait()
+
+            # Clean up previous playback worker if exists
+            if hasattr(self, 'playback_worker') and self.playback_worker:
+                self.playback_worker.deleteLater()
+
             self.playback_worker = StalkerPlaybackWorker(self.entry_data, stream_id, stream_type)
             self.playback_thread = QThread()
             self.playback_worker.moveToThread(self.playback_thread)
             self.playback_worker.link_ready.connect(self.launch_stalker_player)
             self.playback_worker.error_occurred.connect(self.on_load_error)
             self.playback_thread.started.connect(self.playback_worker.run)
-            self.playback_thread.finished.connect(self.playback_thread.deleteLater)
+            # Connecting finished to deleteLater is unsafe here as we manage lifecycle manually
+            # self.playback_thread.finished.connect(self.playback_thread.deleteLater)
             self.playback_thread.start()
             return
 
@@ -1481,7 +1491,7 @@ class PlaylistBrowserDialog(QDialog):
     @Slot(str, str)
     def launch_stalker_player(self, url, cookies):
         self.status_label.setText("Launching player...")
-        if self.playback_thread:
+        if self.playback_thread and self.playback_thread.isRunning():
             self.playback_thread.quit()
             self.playback_thread.wait() # Ensure it stops
 

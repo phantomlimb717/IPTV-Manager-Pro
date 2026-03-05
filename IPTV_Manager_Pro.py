@@ -47,21 +47,10 @@ except ImportError:
     print("\nError: Required library 'PySide6' not found. Please install it: pip install PySide6", file=sys.stderr)
     sys.exit(1)
 
-from companion_utils import MediaPlayerManager
+from companion_utils import MediaPlayerManager, ThemeManager, resource_path
 from core_checker import IPTVChecker
 from stalker_integration import StalkerPortal, MAG_USER_AGENT
 from epg_manager import EpgManager
-
-# --- Resource Path Helper for PyInstaller ---
-def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
-    try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-
-    return os.path.join(base_path, relative_path)
 
 # --- Configuration ---
 APP_NAME = "IPTV Manager Pro"
@@ -397,27 +386,8 @@ class EntryDialog(QDialog):
         self.setMinimumWidth(600)
         self.setWindowModality(Qt.WindowModal)
 
-        # Apply custom stylesheet for taller fields and consistent look
-        self.setStyleSheet("""
-            QLineEdit, QComboBox {
-                min-height: 30px;
-                padding: 5px;
-                font-size: 13px;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-            }
-            QCheckBox {
-                spacing: 8px;
-                font-size: 13px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-            }
-            QLabel {
-                font-size: 13px;
-            }
-        """)
+        # Custom styling is now managed globally via theme QSS files
+        self.setObjectName("EntryDialog")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20) # Inner dialog padding
@@ -2714,38 +2684,22 @@ class MainWindow(QMainWindow):
             logging.error(f"Error saving settings: {e}")
 
     def set_theme(self, theme_name):
-        # TODO: Implement actual theme switching logic
-        if theme_name == "light":
-            self.light_theme_action.setChecked(True)
-            self.dark_theme_action.setChecked(False)
-            QApplication.instance().setStyleSheet("""
-                QWidget { background-color: #f0f0f0; color: #333; }
-                QTableView { background-color: white; selection-background-color: #a6cfff; }
-                QHeaderView::section { background-color: #e0e0e0; }
-                QPushButton { background-color: #d0d0d0; border: 1px solid #b0b0b0; padding: 5px; }
-                QPushButton:hover { background-color: #c0c0c0; }
-                QLineEdit, QComboBox { background-color: white; border: 1px solid #ccc; padding: 3px; }
-                QMenu { background-color: #f0f0f0; border: 1px solid #ccc; }
-                QMenu::item { padding: 5px 20px; }
-                QMenu::item:selected { background-color: #a6cfff; }
-            """)
-        elif theme_name == "dark":
-            self.dark_theme_action.setChecked(True)
-            self.light_theme_action.setChecked(False)
-            QApplication.instance().setStyleSheet("""
-                QWidget { background-color: #2e2e2e; color: #f0f0f0; }
-                QTableView { background-color: #3e3e3e; selection-background-color: #5a5a5a; }
-                QHeaderView::section { background-color: #4e4e4e; }
-                QPushButton { background-color: #5e5e5e; border: 1px solid #7e7e7e; padding: 5px; }
-                QPushButton:hover { background-color: #6e6e6e; }
-                QLineEdit, QComboBox { background-color: #4e4e4e; border: 1px solid #6e6e6e; padding: 3px; }
-                QMenu { background-color: #3e3e3e; color: #f0f0f0; border: 1px solid #555; }
-                QMenu::item { padding: 5px 20px; }
-                QMenu::item:selected { background-color: #5a5a5a; }
-                QStatusBar { background-color: #2e2e2e; }
-            """)
-        self.save_settings()
-        self.refresh_table_coloring_on_theme_change() # Add this call
+        """Applies the selected theme using ThemeManager."""
+        theme_manager = ThemeManager()
+        stylesheet = theme_manager.get_stylesheet(theme_name)
+        if stylesheet:
+            QApplication.instance().setStyleSheet(stylesheet)
+            if theme_name == "light":
+                self.light_theme_action.setChecked(True)
+                self.dark_theme_action.setChecked(False)
+            elif theme_name == "dark":
+                self.dark_theme_action.setChecked(True)
+                self.light_theme_action.setChecked(False)
+
+            self.save_settings()
+            self.refresh_table_coloring_on_theme_change()
+        else:
+            logging.error(f"Failed to apply theme: {theme_name}")
 
     def refresh_table_coloring_on_theme_change(self):
         """Refreshes the coloring of status items in the table after a theme change."""

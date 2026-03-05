@@ -1,6 +1,7 @@
 # companion_utils.py
 
 import os
+import sys
 import platform
 import subprocess
 import shutil
@@ -8,6 +9,58 @@ import logging
 import json
 
 from PySide6.QtWidgets import QMessageBox
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+class ThemeManager:
+    """
+    Manages loading and applying themes from external QSS files.
+    """
+    _instance = None
+    _qss_cache = {}
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(ThemeManager, cls).__new__(cls)
+            cls._instance._load_theme_config()
+        return cls._instance
+
+    def _load_theme_config(self):
+        config_path = resource_path(os.path.join("styles", "themes.json"))
+        try:
+            with open(config_path, 'r') as f:
+                self.config = json.load(f)
+        except Exception as e:
+            logging.error(f"Failed to load theme config: {e}")
+            self.config = {"themes": {}, "default": "light"}
+
+    def get_stylesheet(self, theme_name):
+        """Loads and returns the QSS content for the given theme name."""
+        if theme_name in self._qss_cache:
+            return self._qss_cache[theme_name]
+
+        theme_file = self.config.get("themes", {}).get(theme_name)
+        if not theme_file:
+            logging.warning(f"Theme '{theme_name}' not found in config.")
+            return ""
+
+        qss_path = resource_path(theme_file)
+        try:
+            with open(qss_path, 'r') as f:
+                qss_content = f.read()
+                self._qss_cache[theme_name] = qss_content
+                return qss_content
+        except Exception as e:
+            logging.error(f"Failed to load QSS file {qss_path}: {e}")
+            return ""
 
 class MediaPlayerManager:
     """

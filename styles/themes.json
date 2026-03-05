@@ -1,0 +1,7 @@
+{
+    "themes": {
+        "light": "styles/light.qss",
+        "dark": "styles/dark.qss"
+    },
+    "default": "light"
+}

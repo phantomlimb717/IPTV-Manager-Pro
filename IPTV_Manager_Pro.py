@@ -2236,69 +2236,44 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def delete_duplicates_action(self):
+        duplicates_to_delete = []
         try:
-            all_entries = get_all_entries()
+            conn = get_db_connection()
+            # Use window functions to identify duplicates directly in SQL.
+            # Logic: Partition by key credentials and order by last_checked_at (latest first) then ID.
+            # Records with row_number > 1 are duplicates to be removed.
+            query = """
+                SELECT id FROM (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY
+                                   CASE
+                                       WHEN COALESCE(account_type, 'xc') = 'stalker' THEN portal_url
+                                       ELSE server_base_url
+                                   END,
+                                   CASE
+                                       WHEN COALESCE(account_type, 'xc') = 'stalker' THEN mac_address
+                                       ELSE username
+                                   END,
+                                   CASE
+                                       WHEN COALESCE(account_type, 'xc') = 'stalker' THEN ''
+                                       ELSE password
+                                   END,
+                                   COALESCE(account_type, 'xc')
+                               ORDER BY
+                                   last_checked_at DESC,
+                                   id ASC
+                           ) as rn
+                    FROM entries
+                ) WHERE rn > 1
+            """
+            rows = conn.execute(query).fetchall()
+            duplicates_to_delete = [row['id'] for row in rows]
+            conn.close()
         except Exception as e:
+            logging.error(f"Error finding duplicates in DB: {e}")
             QMessageBox.critical(self, "Database Error", f"Could not retrieve entries to check for duplicates: {e}")
             return
-
-        xtream_map = {}
-        stalker_map = {}
-        duplicates_to_delete = set()
-
-        for entry in all_entries:
-            entry_id = entry['id']
-            account_type = entry['account_type'] if entry['account_type'] is not None else 'xc'
-
-            if account_type == 'xc':
-                key = (entry['server_base_url'], entry['username'], entry['password'])
-                if key in xtream_map:
-                    existing_id, existing_last_checked = xtream_map[key]
-                    current_last_checked = entry['last_checked_at']
-
-                    if existing_last_checked is None and current_last_checked is None:
-                        # If both are None, keep the one with the lower ID
-                        if entry_id > existing_id:
-                            duplicates_to_delete.add(entry_id)
-                        else:
-                            duplicates_to_delete.add(existing_id)
-                            xtream_map[key] = (entry_id, current_last_checked)
-                    elif current_last_checked is None:
-                        duplicates_to_delete.add(entry_id)
-                    elif existing_last_checked is None:
-                        duplicates_to_delete.add(existing_id)
-                        xtream_map[key] = (entry_id, current_last_checked)
-                    elif current_last_checked > existing_last_checked:
-                        duplicates_to_delete.add(existing_id)
-                        xtream_map[key] = (entry_id, current_last_checked)
-                    else:
-                        duplicates_to_delete.add(entry_id)
-                else:
-                    xtream_map[key] = (entry_id, entry['last_checked_at'])
-            elif account_type == 'stalker':
-                key = (entry['portal_url'], entry['mac_address'])
-                if key in stalker_map:
-                    existing_id, existing_last_checked = stalker_map[key]
-                    current_last_checked = entry['last_checked_at']
-
-                    if existing_last_checked is None and current_last_checked is None:
-                        if entry_id > existing_id:
-                            duplicates_to_delete.add(entry_id)
-                        else:
-                            duplicates_to_delete.add(existing_id)
-                            stalker_map[key] = (entry_id, current_last_checked)
-                    elif current_last_checked is None:
-                        duplicates_to_delete.add(entry_id)
-                    elif existing_last_checked is None:
-                        duplicates_to_delete.add(existing_id)
-                        stalker_map[key] = (entry_id, current_last_checked)
-                    elif current_last_checked > existing_last_checked:
-                        duplicates_to_delete.add(existing_id)
-                        stalker_map[key] = (entry_id, current_last_checked)
-                    else:
-                        duplicates_to_delete.add(entry_id)
-                else:
-                    stalker_map[key] = (entry_id, entry['last_checked_at'])
 
         if not duplicates_to_delete:
             QMessageBox.information(self, "No Duplicates Found", "No duplicate entries were found.")

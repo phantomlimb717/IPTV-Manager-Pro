@@ -221,6 +221,24 @@ def update_entry_category(entry_id, category):
     finally:
         conn.close()
 
+def update_entries_category_bulk(entry_ids, category):
+    if not entry_ids:
+        return
+    conn = get_db_connection()
+    try:
+        # SQLite has a limit on the number of parameters (usually 999)
+        chunk_size = 900
+        for i in range(0, len(entry_ids), chunk_size):
+            chunk = entry_ids[i:i + chunk_size]
+            placeholders = ', '.join(['?'] * len(chunk))
+            query = f"UPDATE entries SET category = ? WHERE id IN ({placeholders})"
+            params = [category] + list(chunk)
+            conn.execute(query, params)
+        conn.commit()
+        logging.info(f"Bulk updated category for {len(entry_ids)} entries to {category}")
+    finally:
+        conn.close()
+
 def delete_entry(entry_id):
     conn = get_db_connection()
     try:
@@ -228,6 +246,22 @@ def delete_entry(entry_id):
         conn.commit()
         logging.info(f"Deleted entry ID: {entry_id}")
     finally: conn.close()
+
+def delete_entries(entry_ids):
+    if not entry_ids:
+        return
+    conn = get_db_connection()
+    try:
+        chunk_size = 900
+        for i in range(0, len(entry_ids), chunk_size):
+            chunk = entry_ids[i:i + chunk_size]
+            placeholders = ', '.join(['?'] * len(chunk))
+            query = f"DELETE FROM entries WHERE id IN ({placeholders})"
+            conn.execute(query, chunk)
+        conn.commit()
+        logging.info(f"Deleted {len(entry_ids)} entries.")
+    finally:
+        conn.close()
 
 def get_all_entries(category_filter=None):
     conn = get_db_connection()
@@ -2179,8 +2213,7 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             new_category = dialog.get_selected_category()
             try:
-                for entry_id in selected_ids:
-                    update_entry_category(entry_id, new_category)
+                update_entries_category_bulk(selected_ids, new_category)
                 self.load_entries_to_table()
                 QMessageBox.information(self, "Success", f"{len(selected_ids)} entries have been moved to the '{new_category}' category.")
             except Exception as e:
@@ -2199,9 +2232,10 @@ class MainWindow(QMainWindow):
                 id_item = self.table_model.itemFromIndex(src_idx.siblingAtColumn(COL_ID))
                 if id_item: ids_del.append(id_item.data(Qt.UserRole))
 
-            for entry_id in ids_del:
-                try: delete_entry(entry_id)
-                except Exception as e: QMessageBox.warning(self, "Delete Error", f"Could not delete ID {entry_id}: {e}")
+            try:
+                delete_entries(ids_del)
+            except Exception as e:
+                QMessageBox.warning(self, "Delete Error", f"Could not delete entries: {e}")
             self.load_entries_to_table()
 
     @Slot()
@@ -2254,15 +2288,13 @@ class MainWindow(QMainWindow):
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
 
         if reply == QMessageBox.Yes:
-            deleted_count = 0
-            for entry_id in duplicates_to_delete:
-                try:
-                    delete_entry(entry_id)
-                    deleted_count += 1
-                except Exception as e:
-                    logging.error(f"Could not delete duplicate entry with ID {entry_id}: {e}")
+            try:
+                delete_entries(duplicates_to_delete)
+                QMessageBox.information(self, "Deletion Complete", f"Successfully deleted {len(duplicates_to_delete)} duplicate entries.")
+            except Exception as e:
+                logging.error(f"Could not delete duplicate entries: {e}")
+                QMessageBox.critical(self, "Delete Error", f"Could not delete duplicate entries: {e}")
 
-            QMessageBox.information(self, "Deletion Complete", f"Successfully deleted {deleted_count} duplicate entries.")
             self.load_entries_to_table()
 
     @Slot()

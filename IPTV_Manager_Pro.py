@@ -1284,11 +1284,11 @@ class PlaylistBrowserDialog(QDialog):
     @Slot(QTreeWidgetItem, int)
     def on_category_clicked(self, item, column):
         # Stop any existing worker threads before starting a new one
-        if self.stream_worker_thread and self.stream_worker_thread.isRunning():
+        if self.stream_worker_thread:
             self.stream_worker_thread.quit()
-            self.stream_worker_thread.wait() # Wait for the thread to finish
+            self.stream_worker_thread.wait()
 
-        if self.series_info_thread and self.series_info_thread.isRunning():
+        if self.series_info_thread:
             self.series_info_thread.quit()
             self.series_info_thread.wait()
 
@@ -1438,9 +1438,9 @@ class PlaylistBrowserDialog(QDialog):
             self.playback_worker.moveToThread(self.playback_thread)
             self.playback_worker.link_ready.connect(self.launch_stalker_player)
             self.playback_worker.error_occurred.connect(self.on_load_error)
+            self.playback_worker.finished.connect(self.playback_thread.quit)
+            self.playback_worker.finished.connect(self.playback_worker.deleteLater)
             self.playback_thread.started.connect(self.playback_worker.run)
-            # Connecting finished to deleteLater is unsafe here as we manage lifecycle manually
-            # self.playback_thread.finished.connect(self.playback_thread.deleteLater)
             self.playback_thread.start()
             return
 
@@ -1461,9 +1461,9 @@ class PlaylistBrowserDialog(QDialog):
     @Slot(str, str)
     def launch_stalker_player(self, url, cookies):
         self.status_label.setText("Launching player...")
-        if self.playback_thread and self.playback_thread.isRunning():
+        if self.playback_thread:
             self.playback_thread.quit()
-            self.playback_thread.wait() # Ensure it stops
+            self.playback_thread.wait()
 
         # Ensure Referer ends with /c/ as per MAG standard
         portal_url = self.entry_data.get('portal_url', '')
@@ -1485,7 +1485,7 @@ class PlaylistBrowserDialog(QDialog):
         self.media_player_manager.play_stream(stream_url, self, referer_url=server)
 
     def fetch_series_episodes(self, series_id):
-        if self.series_info_thread and self.series_info_thread.isRunning():
+        if self.series_info_thread:
             self.series_info_thread.quit()
             self.series_info_thread.wait()
 
@@ -1562,18 +1562,11 @@ class PlaylistBrowserDialog(QDialog):
         self.series_info_thread.quit()
 
     def closeEvent(self, event):
-        if self.category_worker_thread and self.category_worker_thread.isRunning():
-            self.category_worker_thread.quit()
-            self.category_worker_thread.wait()
-        if self.stream_worker_thread and self.stream_worker_thread.isRunning():
-            self.stream_worker_thread.quit()
-            self.stream_worker_thread.wait()
-        if self.series_info_thread and self.series_info_thread.isRunning():
-            self.series_info_thread.quit()
-            self.series_info_thread.wait()
-        if self.playback_thread and self.playback_thread.isRunning():
-            self.playback_thread.quit()
-            self.playback_thread.wait()
+        for thread in (self.category_worker_thread, self.stream_worker_thread,
+                       self.series_info_thread, self.playback_thread):
+            if thread:
+                thread.quit()
+                thread.wait()
 
         if hasattr(self, 'epg_manager') and self.epg_manager.isRunning():
             self.epg_manager.stop()

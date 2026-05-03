@@ -3,7 +3,7 @@
 QWidget {
     background-color: #2b2b2b;
     color: #efefef;
-    font-size: 13px;
+    font-size: 10pt;
 }
 
 QMainWindow, QDialog {

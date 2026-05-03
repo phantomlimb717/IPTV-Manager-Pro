@@ -2028,29 +2028,29 @@ class MainWindow(QMainWindow):
         has_selection = selection_model.hasSelection()
         selected_row_count = len(selection_model.selectedRows(0))
 
-        can_interact = not self._is_checking_api
+        not_checking = not self._is_checking_api
 
-        self.edit_button.setEnabled(selected_row_count == 1 and can_interact)
-        self.browse_button.setEnabled(selected_row_count == 1 and can_interact)
-        self.delete_button.setEnabled(has_selection and can_interact)
-        self.bulk_edit_button.setEnabled(has_selection and can_interact)
-        self.check_selected_button.setEnabled(has_selection and can_interact)
-        self.export_txt_button.setEnabled(has_selection and can_interact)
+        # Edit/delete/re-check stay locked during a check to avoid write conflicts
+        self.edit_button.setEnabled(selected_row_count == 1 and not_checking)
+        self.delete_button.setEnabled(has_selection and not_checking)
+        self.bulk_edit_button.setEnabled(has_selection and not_checking)
+        self.check_selected_button.setEnabled(has_selection and not_checking)
+        self.check_all_button.setEnabled(self.proxy_model.rowCount() > 0 and not_checking)
 
-        self.check_all_button.setEnabled(self.proxy_model.rowCount() > 0 and can_interact)
+        # Read-only actions are always available
+        self.browse_button.setEnabled(selected_row_count == 1)
+        self.export_txt_button.setEnabled(has_selection)
+        self.add_button.setEnabled(True)
+        self.import_url_button.setEnabled(not_checking)
+        self.import_file_button.setEnabled(not_checking)
+        self.manage_categories_button.setEnabled(True)
+        self.category_filter_combo.setEnabled(True)
+        self.search_edit.setEnabled(True)
+        self.exclude_na_button.setEnabled(True)
 
         current_proxy_index = self.table_view.currentIndex()
         is_valid_current_item = current_proxy_index.isValid() and current_proxy_index.row() >= 0
-        self.export_clipboard_button.setEnabled(is_valid_current_item and can_interact)
-
-        self.add_button.setEnabled(can_interact)
-        self.import_url_button.setEnabled(can_interact)
-        self.import_file_button.setEnabled(can_interact)
-        self.manage_categories_button.setEnabled(can_interact)
-
-        self.category_filter_combo.setEnabled(can_interact)
-        self.search_edit.setEnabled(can_interact)
-        self.exclude_na_button.setEnabled(can_interact)
+        self.export_clipboard_button.setEnabled(is_valid_current_item)
 
 
     @Slot()
